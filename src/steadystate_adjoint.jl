@@ -131,7 +131,7 @@ end
     end
 
     linear_problem = LinearProblem(A_, vec(dgdu_val'); u0 = vec(λ))
-    sol = solve(linear_problem, linsolve; alias_A = true) # u is vec(λ)
+    sol = solve(linear_problem, linsolve; alias_A = true, sensealg.linsolve_kwargs...) # u is vec(λ)
 
     try
         vecjacobian!(vec(dgdu_val), y, λ, p, nothing, sense; dgrad = vjp, dy = nothing)
