@@ -1,8 +1,8 @@
 # Training a Neural Ordinary Differential Equation with Mini-Batching
 
 ```@example
-using DifferentialEquations, Flux, Random, Plots
-using IterTools: ncycle
+using OrdinaryDiffEq, Lux, SciMLSensitivity, OrdinaryDiffEq, Optimization,
+    OptimizationOptimisers, Random, Plots, ComponentArrays, Zygote, IterTools
 
 rng = Random.default_rng()
 
@@ -18,20 +18,22 @@ function true_sol(du, u, p, t)
 end
 
 ann = Chain(Dense(1, 8, tanh), Dense(8, 1, tanh))
-θ, re = Flux.destructure(ann)
+θ, st = Lux.setup(rng, ann)
+θ = ComponentArray(θ)
+ann = Lux.Experimental.StatefulLuxLayer(ann, θ, st)
 
 function dudt_(u, p, t)
-    re(p)(u)[1] .* u
+    ann(u, p) .* u
 end
 
-function predict_adjoint(time_batch)
-    _prob = remake(prob, u0 = u0, p = θ)
+function predict_adjoint(p, time_batch)
+    _prob = remake(prob, u0 = u0, p = p)
     Array(solve(_prob, Tsit5(), saveat = time_batch))
 end
 
-function loss_adjoint(batch, time_batch)
-    pred = predict_adjoint(time_batch)
-    sum(abs2, batch - pred)#, pred
+function loss_adjoint(p, batch, time_batch)
+    pred = predict_adjoint(p, time_batch)
+    sum(abs2, reduce(hcat, batch) - pred), pred
 end
 
 u0 = Float32[200.0]
@@ -45,33 +47,28 @@ ode_data = Array(solve(true_prob, Tsit5(), saveat = t))
 prob = ODEProblem{false}(dudt_, u0, tspan, θ)
 
 k = 10
-train_loader = Flux.Data.DataLoader((ode_data, t), batchsize = k)
+train_loader = zip(Iterators.partition(eachcol(ode_data), k), Iterators.partition(t, k))
 
 for (x, y) in train_loader
-    @show x
+    @show reduce(hcat, x)
     @show y
 end
 
 numEpochs = 300
 losses = []
-function cb()
-    begin
-        l = loss_adjoint(ode_data, t)
-        push!(losses, l)
-        @show l
-        pred = predict_adjoint(t)
-        pl = scatter(t, ode_data[1, :], label = "data", color = :black, ylim = (150, 200))
-        scatter!(pl, t, pred[1, :], label = "prediction", color = :darkgreen)
-        display(plot(pl))
-        false
-    end
+function cb(p, l, pred)
+    push!(losses, l)
+    @show l
+    pl = scatter(t, ode_data[1, :], label = "data", color = :black, ylim = (150, 200))
+    scatter!(pl, t, pred[1, :], label = "prediction", color = :darkgreen)
+    display(plot(pl))
+    false
 end
 
-opt = Adam(0.05)
-Flux.train!(loss_adjoint, Flux.params(θ), ncycle(train_loader, numEpochs), opt,
-    cb = Flux.throttle(cb, 10))
+opt_prob = OptimizationProblem(OptimizationFunction((θ, p, data_batch, time_batch) -> loss_adjoint(θ, data_batch, time_batch), AutoZygote()), θ)
+res = solve(opt_prob, Adam(0.001), IterTools.ncycle(train_loader, 300), callback = cb)
 
-#Now lets see how well it generalizes to new initial conditions 
+# Now lets see how well it generalizes to new initial conditions 
 
 starting_temp = collect(10:30:250)
 true_prob_func(u0) = ODEProblem(true_sol, [u0], tspan)
@@ -80,7 +77,7 @@ pl = plot()
 for (j, temp) in enumerate(starting_temp)
     ode_test_sol = solve(ODEProblem(true_sol, [temp], (0.0f0, 10.0f0)), Tsit5(),
         saveat = 0.0:0.5:10.0)
-    ode_nn_sol = solve(ODEProblem{false}(dudt_, [temp], (0.0f0, 10.0f0), θ))
+    ode_nn_sol = solve(ODEProblem{false}(dudt_, [temp], (0.0f0, 10.0f0), res.u), Tsit5())
     scatter!(pl, ode_test_sol, var = (0, 1), label = "", color = color_cycle[j])
     plot!(pl, ode_nn_sol, var = (0, 1), label = "", color = color_cycle[j], lw = 2.0)
 end
@@ -95,8 +92,8 @@ When training a neural network, we need to find the gradient with respect to our
 For this example, we will use a very simple ordinary differential equation, newtons law of cooling. We can represent this in Julia like so.
 
 ```@example minibatch
-using DifferentialEquations, Flux, Random, Plots
-using IterTools: ncycle
+using OrdinaryDiffEq, Lux, SciMLSensitivity, OrdinaryDiffEq, Optimization,
+    OptimizationOptimisers, Random, Plots, ComponentArrays, Zygote, IterTools
 
 rng = Random.default_rng()
 function newtons_cooling(du, u, p, t)
@@ -114,29 +111,32 @@ end
 Now we define a neural-network using a linear approximation with 1 hidden layer of 8 neurons.
 
 ```@example minibatch
+
 ann = Chain(Dense(1, 8, tanh), Dense(8, 1, tanh))
-θ, re = Flux.destructure(ann)
+θ, st = Lux.setup(rng, ann)
+θ = ComponentArray(θ)
+ann = Lux.Experimental.StatefulLuxLayer(ann, θ, st)
 
 function dudt_(u, p, t)
-    re(p)(u)[1] .* u
+    ann(u, p) .* u
 end
 ```
 
 From here we build a loss function around it.
 
 ```@example minibatch
-function predict_adjoint(time_batch)
-    _prob = remake(prob, u0 = u0, p = θ)
+function predict_adjoint(p, time_batch)
+    _prob = remake(prob, u0 = u0, p = p)
     Array(solve(_prob, Tsit5(), saveat = time_batch))
 end
 
-function loss_adjoint(batch, time_batch)
-    pred = predict_adjoint(time_batch)
-    sum(abs2, batch - pred)#, pred
+function loss_adjoint(p, batch, time_batch)
+    pred = predict_adjoint(p, time_batch)
+    sum(abs2, reduce(hcat, batch) - pred), pred
 end
 ```
 
-To add support for batches of size `k` we use `Flux.Data.DataLoader`. To use this we pass in the `ode_data` and `t` as the 'x' and 'y' data to batch respectively. The parameter `batchsize` controls the size of our batches. We check our implementation by iterating over the batched data.
+To add support for batches of size `k`. To use this we pass in the `ode_data` and `t` as the 'x' and 'y' data to batch respectively. The parameter `batchsize` controls the size of our batches. We check our implementation by iterating over the batched data.
 
 ```@example minibatch
 u0 = Float32[200.0]
@@ -150,35 +150,26 @@ ode_data = Array(solve(true_prob, Tsit5(), saveat = t))
 prob = ODEProblem{false}(dudt_, u0, tspan, θ)
 
 k = 10
-train_loader = Flux.Data.DataLoader((ode_data, t), batchsize = k)
+train_loader = zip(Iterators.partition(eachcol(ode_data), k), Iterators.partition(t, k))
 
 for (x, y) in train_loader
-    @show x
+    @show reduce(hcat, x)
     @show y
 end
-```
 
-Now we train the neural network with a user-defined call back function to display loss and the graphs with a maximum of 300 epochs.
-
-```@example minibatch
 numEpochs = 300
 losses = []
-function cb()
-    begin
-        l = loss_adjoint(ode_data, t)
-        push!(losses, l)
-        @show l
-        pred = predict_adjoint(t)
-        pl = scatter(t, ode_data[1, :], label = "data", color = :black, ylim = (150, 200))
-        scatter!(pl, t, pred[1, :], label = "prediction", color = :darkgreen)
-        display(plot(pl))
-        false
-    end
+function cb(p, l, pred)
+    push!(losses, l)
+    @show l
+    pl = scatter(t, ode_data[1, :], label = "data", color = :black, ylim = (150, 200))
+    scatter!(pl, t, pred[1, :], label = "prediction", color = :darkgreen)
+    display(plot(pl))
+    false
 end
 
-opt = Adam(0.05)
-Flux.train!(loss_adjoint, Flux.params(θ), ncycle(train_loader, numEpochs), opt,
-    cb = Flux.throttle(cb, 10))
+opt_prob = OptimizationProblem(OptimizationFunction((θ, p, data_batch, time_batch) -> loss_adjoint(θ, data_batch, time_batch), AutoZygote()), θ)
+res = solve(opt_prob, Adam(0.001), IterTools.ncycle(train_loader, 300), callback = cb)
 ```
 
 Finally, we can see how well our trained network will generalize to new initial conditions.
@@ -191,7 +182,7 @@ pl = plot()
 for (j, temp) in enumerate(starting_temp)
     ode_test_sol = solve(ODEProblem(true_sol, [temp], (0.0f0, 10.0f0)), Tsit5(),
         saveat = 0.0:0.5:10.0)
-    ode_nn_sol = solve(ODEProblem{false}(dudt_, [temp], (0.0f0, 10.0f0), θ))
+    ode_nn_sol = solve(ODEProblem{false}(dudt_, [temp], (0.0f0, 10.0f0), res.u), Tsit5())
     scatter!(pl, ode_test_sol, var = (0, 1), label = "", color = color_cycle[j])
     plot!(pl, ode_nn_sol, var = (0, 1), label = "", color = color_cycle[j], lw = 2.0)
 end

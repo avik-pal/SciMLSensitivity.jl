@@ -149,7 +149,7 @@ loss_sde(p) = sum(abs2, x - 1 for x in predict_sde(p))
 ```
 
 For this training process, because the loss function is stochastic, we will use
-the `Adam` optimizer from Flux.jl. The `Optimization.solve` function is the same as
+the `Adam` optimizer from Optimisers.jl. The `Optimization.solve` function is the same as
 before. However, to speed up the training process, we will use a global counter
 so that way we only plot the current results every 10 iterations. This looks
 like:

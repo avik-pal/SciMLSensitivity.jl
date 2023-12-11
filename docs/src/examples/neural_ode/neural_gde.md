@@ -6,18 +6,15 @@ In this tutorial, we will use Graph Differential Equations (GDEs) to perform cla
 
 ```julia
 # Load the packages
-using GraphNeuralNetworks, DifferentialEquations
-using DiffEqFlux: NeuralODE
+using GraphNeuralNetworks, OrdinaryDiffEq, DiffEqFlux, Lux, Zygote, ComponentArrays,
+    Optimisers, Random, SciMLSensitivity, Statistics
 using GraphNeuralNetworks.GNNGraphs: normalized_adjacency
-using Lux, NNlib, Optimisers, Zygote, Random, ComponentArrays
-using Lux: AbstractExplicitLayer, glorot_normal, zeros32
-import Lux: initialparameters, initialstates
-using SciMLSensitivity
-using Statistics: mean
+import Lux: AbstractExplicitLayer, initialparameters, initialstates
 using MLDatasets: Cora
-using CUDA
+using LuxCUDA
 CUDA.allowscalar(false)
-device = CUDA.functional() ? gpu : cpu
+
+device = gpu_device()
 
 # Download the dataset
 dataset = Cora();
@@ -79,7 +76,7 @@ end
 
 # Define the Neural GDE
 function diffeqsol_to_array(x::ODESolution{T, N, <:AbstractVector{<:CuArray}}) where {T, N}
-    return dropdims(gpu(x); dims = 3)
+    return dropdims(device(x); dims = 3)
 end
 diffeqsol_to_array(x::ODESolution) = dropdims(Array(x); dims = 3)
 
@@ -94,9 +91,7 @@ gnn = Chain(ExplicitGCNConv(Ã, nhidden => nhidden, relu),
 node = NeuralODE(gnn, (0.0f0, 1.0f0), Tsit5(), save_everystep = false,
     reltol = 1e-3, abstol = 1e-3, save_start = false)
 
-model = Chain(ExplicitGCNConv(Ã, nin => nhidden, relu),
-    node,
-    diffeqsol_to_array,
+model = Chain(ExplicitGCNConv(Ã, nin => nhidden, relu), node, diffeqsol_to_array,
     Dense(nhidden, nout))
 
 # Loss
@@ -146,18 +141,15 @@ train()
 
 ```julia
 # Load the packages
-using GraphNeuralNetworks, DifferentialEquations
-using DiffEqFlux: NeuralODE
+using GraphNeuralNetworks, OrdinaryDiffEq, DiffEqFlux, Lux, Zygote, ComponentArrays,
+    Optimisers, Random, SciMLSensitivity, Statistics
 using GraphNeuralNetworks.GNNGraphs: normalized_adjacency
-using Lux, NNlib, Optimisers, Zygote, Random, ComponentArrays
-using Lux: AbstractExplicitLayer, glorot_normal, zeros32
-import Lux: initialparameters, initialstates
-using SciMLSensitivity
-using Statistics: mean
+import Lux: AbstractExplicitLayer, initialparameters, initialstates
 using MLDatasets: Cora
-using CUDA
+using LuxCUDA
 CUDA.allowscalar(false)
-device = CUDA.functional() ? gpu : cpu
+
+device = gpu_device()
 ```
 
 ## Load the Dataset
@@ -250,7 +242,7 @@ Let us now define the final model. We will use two GNN layers for approximating 
 
 ```julia
 function diffeqsol_to_array(x::ODESolution{T, N, <:AbstractVector{<:CuArray}}) where {T, N}
-    return dropdims(gpu(x); dims = 3)
+    return dropdims(device(x); dims = 3)
 end
 diffeqsol_to_array(x::ODESolution) = dropdims(Array(x); dims = 3)
 
@@ -260,9 +252,7 @@ gnn = Chain(ExplicitGCNConv(Ã, nhidden => nhidden, relu),
 node = NeuralODE(gnn, (0.0f0, 1.0f0), Tsit5(), save_everystep = false,
     reltol = 1e-3, abstol = 1e-3, save_start = false)
 
-model = Chain(ExplicitGCNConv(Ã, nin => nhidden, relu),
-    node,
-    diffeqsol_to_array,
+model = Chain(ExplicitGCNConv(Ã, nin => nhidden, relu), node, diffeqsol_to_array,
     Dense(nhidden, nout))
 ```
 
