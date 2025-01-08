@@ -32,11 +32,11 @@ end
 grad(p) = Zygote.gradient(loss, p)
 
 p2 = [4; 5; 6]
-@test_throws SciMLSensitivity.ForwardDiffSensitivityParameterCompatibilityError grad(p2)
+@test_throws SciMLSensitivity.SciMLStructuresCompatibilityError grad(p2)
 
 function loss(p1)
     sol = solve(prob, Tsit5(), p = [p1, mystruct(-1, -2), control],
-                sensealg = InterpolatingAdjoint())
+        sensealg = InterpolatingAdjoint())
     return sum(abs2, sol)
 end
 
@@ -44,12 +44,13 @@ end
 
 function loss(p1)
     sol = solve(prob, Tsit5(), p = [p1, mystruct(-1, -2), control],
-                sensealg = ForwardSensitivity())
+        sensealg = ForwardSensitivity())
     return sum(abs2, sol)
 end
 
-@test_throws SciMLSensitivity.ForwardSensitivityParameterCompatibilityError grad(p2)
-@test_throws SciMLSensitivity.ForwardSensitivityParameterCompatibilityError ODEForwardSensitivityProblem(f!,
-                                                                                                         u0,
-                                                                                                         tspan,
-                                                                                                         p)
+@test_throws SciMLSensitivity.SciMLStructuresCompatibilityError grad(p2)
+@test_throws SciMLSensitivity.ForwardSensitivityParameterCompatibilityError ODEForwardSensitivityProblem(
+    f!,
+    u0,
+    tspan,
+    p)

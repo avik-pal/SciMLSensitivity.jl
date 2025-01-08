@@ -17,7 +17,10 @@ matrix multiplication). Thus for example, with `Chain` we can
 define an ODE:
 
 ```@example dataparallel
-using Lux, DiffEqFlux, DifferentialEquations, CUDA, Random
+using Lux, OrdinaryDiffEq, LuxCUDA, Random
+
+gdev = gpu_device()
+
 rng = Random.default_rng()
 
 dudt = Lux.Chain(Lux.Dense(2, 50, tanh), Lux.Dense(50, 2))
@@ -51,13 +54,14 @@ GPU:
 ```@example dataparallel
 xs = Float32.([0 1 2
                0 0 0])
-prob = ODEProblem(f, Lux.gpu(u0), (0.0f0, 1.0f0), Lux.gpu(p))
+prob = ODEProblem(f, gdev(u0), (0.0f0, 1.0f0), gdev(p))
 solve(prob, Tsit5())
 ```
 
 This method of parallelism is optimal if all the operations are
 linear algebra operations, such as a neural ODE. Thus this method of
-parallelism is demonstrated in the [MNIST tutorial](@ref mnist).
+parallelism is demonstrated in the
+[MNIST tutorial](https://docs.sciml.ai/DiffEqFlux/stable/examples/mnist_neural_ode/).
 
 However, this method of parallelism has many limitations. First of all,
 the ODE function is required to be written in a way that is independent
@@ -83,7 +87,7 @@ The following is a full copy-paste example for the multithreading.
 Distributed and GPU minibatching are described below.
 
 ```@example dataparallel
-using DifferentialEquations, Optimization, OptimizationFlux
+using OrdinaryDiffEq, Optimization, OptimizationOptimisers, SciMLSensitivity
 pa = [1.0]
 u0 = [3.0]
 θ = [u0; pa]
@@ -108,7 +112,7 @@ callback = function (θ, l) # callback function to observe training
     false
 end
 
-opt = ADAM(0.1)
+opt = Adam(0.1)
 l1 = loss_serial(θ)
 
 adtype = Optimization.AutoZygote()
@@ -198,7 +202,7 @@ using Distributed
 addprocs(4)
 
 @everywhere begin
-    using DifferentialEquations, Optimization, OptimizationFlux
+    using OrdinaryDiffEq, Optimization, OptimizationOptimisers
     function f(u, p, t)
         1.01u .* p
     end
@@ -224,7 +228,7 @@ callback = function (θ, l) # callback function to observe training
     false
 end
 
-opt = ADAM(0.1)
+opt = Adam(0.1)
 loss_distributed(θ) = sum(abs2, 1.0 .- Array(model1(θ, EnsembleDistributed())))
 l1 = loss_distributed(θ)
 
@@ -251,9 +255,11 @@ The following is an example of minibatch ensemble parallelism across
 a GPU:
 
 ```julia
-using DifferentialEquations, Optimization, OptimizationFlux, DiffEqGPU
+using DifferentialEquations, Optimization, OptimizationOptimisers, DiffEqGPU
 function f(du, u, p, t)
-    @inbounds begin du[1] = 1.01 * u[1] * p[1] * p[2] end
+    @inbounds begin
+        du[1] = 1.01 * u[1] * p[1] * p[2]
+    end
 end
 
 pa = [1.0]
@@ -276,7 +282,7 @@ callback = function (θ, l) # callback function to observe training
     false
 end
 
-opt = ADAM(0.1)
+opt = Adam(0.1)
 loss_gpu(θ) = sum(abs2, 1.0 .- Array(model1(θ, EnsembleGPUArray())))
 l1 = loss_gpu(θ)
 

@@ -5,8 +5,8 @@ supported. For example, we can build a layer with a delay differential equation
 like:
 
 ```@example dde
-using DifferentialEquations, Optimization, SciMLSensitivity,
-      OptimizationPolyalgorithms
+using OrdinaryDiffEq, Optimization, SciMLSensitivity, OptimizationPolyalgorithms,
+      DelayDiffEq
 
 # Define the same LV equation, but including a delay parameter
 function delay_lotka_volterra!(du, u, h, p, t)
@@ -28,26 +28,24 @@ u0 = [1.0, 1.0]
 
 # Define the problem as a delay differential equation
 prob_dde = DDEProblem(delay_lotka_volterra!, u0, h, (0.0, 10.0),
-                      constant_lags = [0.1])
+    constant_lags = [0.1])
 
 function predict_dde(p)
     return Array(solve(prob_dde, MethodOfSteps(Tsit5()),
-                       u0 = u0, p = p, saveat = 0.1,
-                       sensealg = ReverseDiffAdjoint()))
+        u0 = u0, p = p, saveat = 0.1, sensealg = ReverseDiffAdjoint()))
 end
 
 loss_dde(p) = sum(abs2, x - 1 for x in predict_dde(p))
 
 using Plots
-callback = function (p, l...; doplot = false)
-    display(loss_dde(p))
+callback = function (state, l; doplot = false)
+    display(loss_dde(state.u))
     doplot &&
-        display(plot(solve(remake(prob_dde, p = p), MethodOfSteps(Tsit5()), saveat = 0.1),
-                     ylim = (0, 6)))
+        display(plot(
+            solve(remake(prob_dde, p = state.u), MethodOfSteps(Tsit5()), saveat = 0.1),
+            ylim = (0, 6)))
     return false
 end
-
-callback(p, loss_dde(p)...)
 
 adtype = Optimization.AutoZygote()
 optf = Optimization.OptimizationFunction((x, p) -> loss_dde(x), adtype)
@@ -62,15 +60,14 @@ We define a callback to display the solution at the current parameters for each 
 
 ```@example dde
 using Plots
-callback = function (p, l...; doplot = false)
-    display(loss_dde(p))
+callback = function (state, l; doplot = false)
+    display(loss_dde(state.u))
     doplot &&
-        display(plot(solve(remake(prob_dde, p = p), MethodOfSteps(Tsit5()), saveat = 0.1),
-                     ylim = (0, 6)))
+        display(plot(
+            solve(remake(prob_dde, p = state.u), MethodOfSteps(Tsit5()), saveat = 0.1),
+            ylim = (0, 6)))
     return false
 end
-
-callback(p, loss_dde(p)...)
 ```
 
 We use `Optimization.solve` to optimize the parameters for our loss function:

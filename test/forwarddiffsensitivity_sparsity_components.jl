@@ -1,5 +1,5 @@
-using OrdinaryDiffEq, SciMLSensitivity, Flux
-using ComponentArrays, LinearAlgebra, Optimization, Test
+using OrdinaryDiffEq, SciMLSensitivity
+using ComponentArrays, LinearAlgebra, Optimization, OptimizationOptimisers, Test
 
 const nknots = 10
 const h = 1.0 / (nknots + 1)
@@ -23,7 +23,7 @@ prob = ODEProblem(ODEFunction(f, jac_prototype = jac_proto), u0, (0.0, 1.0), p_t
 function loss(p)
     _prob = remake(prob, p = p)
     sol = solve(_prob, Rodas4P(autodiff = false), saveat = 0.1,
-                sensealg = ForwardDiffSensitivity())
+        sensealg = ForwardDiffSensitivity())
     sum((sol .- sol_true) .^ 2)
 end
 
@@ -31,6 +31,6 @@ p0 = ComponentArray(k = 1.0)
 
 optf = Optimization.OptimizationFunction((x, p) -> loss(x), Optimization.AutoZygote())
 optprob = Optimization.OptimizationProblem(optf, p0)
-res = Optimization.solve(optprob, ADAM(0.01), maxiters = 100)
+res = Optimization.solve(optprob, Adam(0.01), maxiters = 100)
 
 @test res.u.k≈0.42461977305259074 rtol=1e-1

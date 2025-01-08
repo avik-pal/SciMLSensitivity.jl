@@ -21,19 +21,22 @@ neural network by the mass!)
 An example of training a neural network on a second order ODE is as follows:
 
 ```@example secondorderneural
-using DifferentialEquations, Flux, Optimization, OptimizationFlux, RecursiveArrayTools,
-      Random
+using SciMLSensitivity
+using OrdinaryDiffEq, Lux, Optimization, OptimizationOptimisers, RecursiveArrayTools,
+      Random, ComponentArrays
 
 u0 = Float32[0.0; 2.0]
 du0 = Float32[0.0; 0.0]
 tspan = (0.0f0, 1.0f0)
 t = range(tspan[1], tspan[2], length = 20)
 
-model = Flux.Chain(Flux.Dense(2, 50, tanh), Flux.Dense(50, 2))
-p, re = Flux.destructure(model)
+model = Chain(Dense(2, 50, tanh), Dense(50, 2))
+ps, st = Lux.setup(Random.default_rng(), model)
+ps = ComponentArray(ps)
+model = Lux.StatefulLuxLayer{true}(model, ps, st)
 
-ff(du, u, p, t) = re(p)(u)
-prob = SecondOrderODEProblem{false}(ff, du0, u0, tspan, p)
+ff(du, u, p, t) = model(u, p)
+prob = SecondOrderODEProblem{false}(ff, du0, u0, tspan, ps)
 
 function predict(p)
     Array(solve(prob, Tsit5(), p = p, saveat = t))
@@ -43,21 +46,19 @@ correct_pos = Float32.(transpose(hcat(collect(0:0.05:1)[2:end], collect(2:-0.05:
 
 function loss_n_ode(p)
     pred = predict(p)
-    sum(abs2, correct_pos .- pred[1:2, :]), pred
+    sum(abs2, correct_pos .- pred[1:2, :])
 end
 
-data = Iterators.repeated((), 1000)
-opt = ADAM(0.01)
+l1 = loss_n_ode(ps)
 
-l1 = loss_n_ode(p)
-
-callback = function (p, l, pred)
+callback = function (state, l)
     println(l)
     l < 0.01
 end
+
 adtype = Optimization.AutoZygote()
 optf = Optimization.OptimizationFunction((x, p) -> loss_n_ode(x), adtype)
-optprob = Optimization.OptimizationProblem(optf, p)
+optprob = Optimization.OptimizationProblem(optf, ps)
 
-res = Optimization.solve(optprob, opt; callback = callback, maxiters = 1000)
+res = Optimization.solve(optprob, Adam(0.01); callback = callback, maxiters = 1000)
 ```

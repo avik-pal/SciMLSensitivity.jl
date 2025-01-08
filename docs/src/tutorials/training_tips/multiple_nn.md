@@ -7,8 +7,9 @@ this kind of study.
 The following is a fully working demo on the Fitzhugh-Nagumo ODE:
 
 ```@example
-using Lux, DiffEqFlux, ComponentArrays, Optimization, OptimizationNLopt,
-      DifferentialEquations, Random
+using SciMLSensitivity
+using Lux, ComponentArrays, Optimization, OptimizationOptimJL,
+      OptimizationOptimisers, OrdinaryDiffEq, Random
 
 rng = Random.default_rng()
 Random.seed!(rng, 1)
@@ -58,18 +59,18 @@ sol_nn = solve(prob_nn, Tsit5(), saveat = sol.t)
 
 function predict(θ)
     Array(solve(prob_nn, Vern7(), p = θ, saveat = sol.t,
-                abstol = 1e-6, reltol = 1e-6,
-                sensealg = InterpolatingAdjoint(autojacvec = ReverseDiffVJP(true))))
+        abstol = 1e-6, reltol = 1e-6,
+        sensealg = InterpolatingAdjoint(autojacvec = ReverseDiffVJP(true))))
 end
 
 # No regularisation right now
 function loss(θ)
     pred = predict(θ)
-    sum(abs2, Xₙ .- pred), pred
+    sum(abs2, Xₙ .- pred)
 end
 loss(p)
 const losses = []
-callback(θ, l, pred) = begin
+callback(θ, l) = begin
     push!(losses, l)
     if length(losses) % 50 == 0
         println(losses[end])
@@ -80,11 +81,12 @@ adtype = Optimization.AutoZygote()
 optf = Optimization.OptimizationFunction((x, p) -> loss(x), adtype)
 
 optprob = Optimization.OptimizationProblem(optf, p)
-res1_uode = Optimization.solve(optprob, ADAM(0.01), callback = callback, maxiters = 500)
+res1_uode = Optimization.solve(optprob, OptimizationOptimisers.Adam(0.01),
+    callback = callback, maxiters = 500)
 
 optprob2 = Optimization.OptimizationProblem(optf, res1_uode.u)
-res2_uode = Optimization.solve(optprob2, NLopt.LD_LBFGS(), maxiters = 10000,
-                               callback = callback)
+res2_uode = Optimization.solve(optprob2, OptimizationOptimJL.BFGS(), maxiters = 10000,
+    callback = callback)
 ```
 
 The key is that `Optimization.solve` acts on a single parameter vector `p`.

@@ -6,7 +6,8 @@ If you want to just get things running, try the following! Explanation will
 follow.
 
 ```@example optode_cp
-using DifferentialEquations, Optimization, OptimizationPolyalgorithms, SciMLSensitivity,
+using OrdinaryDiffEq,
+      Optimization, OptimizationPolyalgorithms, SciMLSensitivity,
       Zygote, Plots
 
 function lotka_volterra!(du, u, p, t)
@@ -38,11 +39,12 @@ savefig("LV_ode.png")
 function loss(p)
     sol = solve(prob, Tsit5(), p = p, saveat = tsteps)
     loss = sum(abs2, sol .- 1)
-    return loss, sol
+    return loss
 end
 
-callback = function (p, l, pred)
+callback = function (state, l)
     display(l)
+    pred = solve(prob, Tsit5(), p = state.u, saveat = tsteps)
     plt = plot(pred, ylim = (0, 6))
     display(plt)
     # Tell Optimization.solve to not halt the optimization. If return true, then
@@ -55,14 +57,14 @@ optf = Optimization.OptimizationFunction((x, p) -> loss(x), adtype)
 optprob = Optimization.OptimizationProblem(optf, p)
 
 result_ode = Optimization.solve(optprob, PolyOpt(),
-                                callback = callback,
-                                maxiters = 100)
+    callback = callback,
+    maxiters = 100)
 ```
 
 ## Explanation
 
-First, let's create a Lotka-Volterra ODE using DifferentialEquations.jl. For
-more details, [see the DifferentialEquations.jl documentation](https://docs.sciml.ai/DiffEqDocs/stable/). The Lotka-Volterra equations have the form:
+First, let's create a Lotka-Volterra ODE using OrdinaryDiffEq.jl. For
+more details, [see the OrdinaryDiffEq.jl documentation](https://docs.sciml.ai/DiffEqDocs/stable/). The Lotka-Volterra equations have the form:
 
 ```math
 \begin{aligned}
@@ -72,7 +74,8 @@ more details, [see the DifferentialEquations.jl documentation](https://docs.scim
 ```
 
 ```@example optode
-using DifferentialEquations, Optimization, OptimizationPolyalgorithms,
+using OrdinaryDiffEq,
+      Optimization, OptimizationPolyalgorithms,
       SciMLSensitivity, Zygote, Plots
 
 function lotka_volterra!(du, u, p, t)
@@ -116,11 +119,11 @@ define our loss as the squared distance from 1.
 function loss(p)
     sol = solve(prob, Tsit5(), p = p, saveat = tsteps)
     loss = sum(abs2, sol .- 1)
-    return loss, sol
+    return loss
 end
 ```
 
-Lastly, we use the `Optimization.solve` function to train the parameters using `ADAM` to
+Lastly, we use the `Optimization.solve` function to train the parameters using `Adam` to
 arrive at parameters which optimize for our goal. `Optimization.solve` allows defining
 a callback that will be called at each step of our training loop. It takes in
 the current parameter vector and the returns of the last call to the loss
@@ -128,8 +131,9 @@ function. We will display the current loss and make a plot of the current
 situation:
 
 ```@example optode
-callback = function (p, l, pred)
+callback = function (state, l)
     display(l)
+    pred = solve(prob, Tsit5(), p = state.u, saveat = tsteps)
     plt = plot(pred, ylim = (0, 6))
     display(plt)
     # Tell Optimization.solve to not halt the optimization. If return true, then
@@ -146,8 +150,8 @@ optf = Optimization.OptimizationFunction((x, p) -> loss(x), adtype)
 optprob = Optimization.OptimizationProblem(optf, p)
 
 result_ode = Optimization.solve(optprob, PolyOpt(),
-                                callback = callback,
-                                maxiters = 100)
+    callback = callback,
+    maxiters = 100)
 ```
 
 In just seconds we found parameters which give a relative loss of `1e-16`! We can
@@ -158,7 +162,7 @@ ODE solution constant:
 
 ```@example optode
 remade_solution = solve(remake(prob, p = result_ode.u), Tsit5(),
-                        saveat = tsteps)
+    saveat = tsteps)
 plot(remade_solution, ylim = (0, 6))
 ```
 

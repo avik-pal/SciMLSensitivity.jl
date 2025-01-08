@@ -12,9 +12,9 @@ example of optimizing `u0` and `p`.
 ```@example neuralode1
 using OrdinaryDiffEq, SciMLSensitivity, Flux, Plots
 
-u0 = Float32[2.0; 0.0]
+u0 = [2.0; 0.0]
 datasize = 30
-tspan = (0.0f0, 1.5f0)
+tspan = (0.0, 1.5)
 
 function trueODEfunc(du, u, p, t)
     true_A = [-0.1 2.0; -2.0 -0.1]
@@ -25,8 +25,8 @@ prob = ODEProblem(trueODEfunc, u0, tspan)
 ode_data = Array(solve(prob, Tsit5(), saveat = t))
 
 dudt2 = Flux.Chain(x -> x .^ 3,
-                   Flux.Dense(2, 50, tanh),
-                   Flux.Dense(50, 2))
+    Flux.Dense(2, 50, tanh),
+    Flux.Dense(50, 2)) |> f64
 p, re = Flux.destructure(dudt2) # use this p as the initial condition!
 dudt(u, p, t) = re(p)(u) # need to restrcture for backprop!
 prob = ODEProblem(dudt, u0, tspan)
@@ -57,7 +57,7 @@ end
 callback()
 
 data = Iterators.repeated((), 1000)
-res1 = Flux.train!(loss_n_ode, Flux.params(u0, p), data, ADAM(0.05), cb = callback)
+res1 = Flux.train!(loss_n_ode, Flux.params(u0, p), data, Adam(0.05), cb = callback)
 
 callback()
 ```
@@ -84,11 +84,11 @@ and `p` and then in the loss function split to the pieces.
 
 ```@example neuralode2
 using Flux, OrdinaryDiffEq, SciMLSensitivity, Optimization, OptimizationOptimisers,
-      OptimizationNLopt, Plots
+      Plots
 
-u0 = Float32[2.0; 0.0]
+u0 = [2.0; 0.0]
 datasize = 30
-tspan = (0.0f0, 1.5f0)
+tspan = (0.0, 1.5)
 
 function trueODEfunc(du, u, p, t)
     true_A = [-0.1 2.0; -2.0 -0.1]
@@ -99,8 +99,8 @@ prob = ODEProblem(trueODEfunc, u0, tspan)
 ode_data = Array(solve(prob, Tsit5(), saveat = t))
 
 dudt2 = Flux.Chain(x -> x .^ 3,
-                   Flux.Dense(2, 50, tanh),
-                   Flux.Dense(50, 2))
+    Flux.Dense(2, 50, tanh),
+    Flux.Dense(50, 2)) |> f64
 p, re = Flux.destructure(dudt2) # use this p as the initial condition!
 dudt(u, p, t) = re(p)(u) # need to restrcture for backprop!
 prob = ODEProblem(dudt, u0, tspan)
@@ -114,14 +114,15 @@ end
 function loss_n_ode(θ)
     pred = predict_n_ode(θ)
     loss = sum(abs2, ode_data .- pred)
-    loss, pred
+    return loss
 end
 
 loss_n_ode(θ)
 
-callback = function (θ, l, pred; doplot = false) #callback function to observe training
+callback = function (state, l; doplot = false) #callback function to observe training
     display(l)
     # plot current prediction against data
+    pred = predict_n_ode(state.u)
     pl = scatter(t, ode_data[1, :], label = "data")
     scatter!(pl, t, pred[1, :], label = "prediction")
     display(plot(pl))
@@ -129,7 +130,7 @@ callback = function (θ, l, pred; doplot = false) #callback function to observe 
 end
 
 # Display the ODE with the initial parameter values.
-callback(θ, loss_n_ode(θ)...)
+callback((; u = θ), loss_n_ode(θ)...)
 
 # use Optimization.jl to solve the problem
 adtype = Optimization.AutoZygote()
@@ -138,18 +139,12 @@ optf = Optimization.OptimizationFunction((p, _) -> loss_n_ode(p), adtype)
 optprob = Optimization.OptimizationProblem(optf, θ)
 
 result_neuralode = Optimization.solve(optprob,
-                                      OptimizationOptimisers.Adam(0.05),
-                                      callback = callback,
-                                      maxiters = 300)
-
-optprob2 = remake(optprob, u0 = result_neuralode.u)
-
-result_neuralode2 = Optimization.solve(optprob2,
-                                       NLopt.LD_LBFGS(),
-                                       callback = callback)
+    OptimizationOptimisers.Adam(0.05),
+    callback = callback,
+    maxiters = 300)
 ```
 
-Notice that the advantage of this format is that we can use Optim's optimizers, like
+Notice that the advantage of this format is that we can use other optimizers, like
 `LBFGS` with a full `Chain` object, for all of Flux's neural networks, like
 convolutional neural networks.
 
