@@ -51,14 +51,14 @@ Note that the Jacobian-vector product
 \frac{\partial f}{\partial u}\frac{\partial u}{\partial p_{j}}
 ```
 
-can be computed without forming the Jacobian. With finite differences, this through using the following
+can be computed without forming the Jacobian. With finite differences, this can be done using the following
 formula for the directional derivative
 
 ```math
 Jv \approx \frac{f(x+v \epsilon) - f(x)}{\epsilon},
 ```
 
-or, alternatively and without truncation error,
+alternatively and without truncation error,
 by using a dual number with a single partial dimension, ``d = x + v \epsilon`` we get that
 
 ```math
@@ -67,13 +67,13 @@ f(d) = f(x) + Jv \epsilon
 
 as a fast way to calculate ``Jv``. Thus, except when a sufficiently good function for `J` is given
 by the user, the Jacobian is never formed. For more details, consult the
-[MIT 18.337 lecture notes on forward mode AD](https://mitmath.github.io/18337/lecture8/automatic_differentiation.html).
+[MIT 18.337 lecture notes on forward mode AD](https://book.sciml.ai/notes/08-Forward-Mode_Automatic_Differentiation_(AD)_via_High_Dimensional_Algebras/).
 
 ## Adjoint Sensitivity Analysis
 
 This adjoint requires the definition of some scalar functional ``g(u,p)``
 where ``u(t,p)`` is the (numerical) solution to the differential equation
-``d/dt u(t,p)=f(t,u,p)`` with ``t\in [0,T]`` and ``u(t_0,p)=u_0``.
+``\frac{du(t,p)}{dt}=f(t,u,p)`` with ``t\in [0,T]`` and ``u(t_0,p)=u_0``.
 Adjoint sensitivity analysis finds the gradient of
 
 ```math
@@ -134,4 +134,4 @@ We note that
 is a vector-transpose Jacobian product, also known as a `vjp`, which can be efficiently computed
 using the pullback of backpropagation on the user function `f` with a forward pass at `u` with a
 pullback vector ``\lambda^{\star}``. For more information, consult the
-[MIT 18.337 lecture notes on reverse mode AD](https://mitmath.github.io/18337/lecture10/estimation_identification).
+[MIT 18.337 lecture notes on reverse mode AD](https://book.sciml.ai/notes/10-Basic_Parameter_Estimation-Reverse-Mode_AD-and_Inverse_Problems/).

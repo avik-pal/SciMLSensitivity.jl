@@ -7,7 +7,7 @@ https://github.com/SciML/SciMLSensitivity.jl/issues/4
 track_callbacks(cb, t, u, p, sensealg) = track_callbacks(CallbackSet(cb), t, u, p, sensealg)
 function track_callbacks(cb::CallbackSet, t, u, p, sensealg)
     CallbackSet(map(cb -> _track_callback(cb, t, u, p, sensealg), cb.continuous_callbacks),
-                map(cb -> _track_callback(cb, t, u, p, sensealg), cb.discrete_callbacks))
+        map(cb -> _track_callback(cb, t, u, p, sensealg), cb.discrete_callbacks))
 end
 
 mutable struct ImplicitCorrection{T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, RefType}
@@ -31,7 +31,8 @@ function ImplicitCorrection(cb, t, u, p, sensealg)
     condition = cb.condition
 
     gt_val = similar(u, 1)
-    gu_val = similar(u)
+    gt_val .= 0
+    gu_val = zero(u)
 
     fakeinteg = FakeIntegrator(u, p, t, t)
     gt, gu = build_condition_wrappers(cb, condition, u, t, fakeinteg)
@@ -39,17 +40,17 @@ function ImplicitCorrection(cb, t, u, p, sensealg)
     gt_conf = build_deriv_config(sensealg, gt, gt_val, t)
     gu_conf = build_grad_config(sensealg, gu, u, p)
 
-    dy_left = similar(u)
-    dy_right = similar(u)
+    dy_left = zero(u)
+    dy_right = zero(u)
 
-    Lu_left = similar(u)
-    Lu_right = similar(u)
+    Lu_left = zero(u)
+    Lu_right = zero(u)
 
     cur_time = Ref(1) # initialize the Ref, set to Ref of loss below
     terminated = false
 
     ImplicitCorrection(gt_val, gu_val, gt, gu, gt_conf, gu_conf, condition, Lu_left,
-                       Lu_right, dy_left, dy_right, cur_time, terminated)
+        Lu_right, dy_left, dy_right, cur_time, terminated)
 end
 
 struct TrackedAffect{T, T2, T3, T4, T5, T6}
@@ -65,9 +66,36 @@ end
 TrackedAffect(t::Number, u, p, affect!::Nothing, correction) = nothing
 function TrackedAffect(t::Number, u, p, affect!, correction)
     TrackedAffect(Vector{typeof(t)}(undef, 0), Vector{typeof(t)}(undef, 0),
-                  Vector{typeof(u)}(undef, 0), Vector{typeof(p)}(undef, 0), affect!,
-                  correction,
-                  Vector{Int}(undef, 0))
+        Vector{typeof(u)}(undef, 0), Vector{typeof(p)}(undef, 0), affect!,
+        correction,
+        Vector{Int}(undef, 0))
+end
+
+function Base.hasproperty(f::TrackedAffect, s::Symbol)
+    if hasfield(TrackedAffect, s)
+        return true
+    else
+        _affect = getfield(f, :affect!)
+        return hasfield(typeof(_affect), s)
+    end
+end
+
+function Base.getproperty(f::TrackedAffect, s::Symbol)
+    if hasfield(TrackedAffect, s)
+        return getfield(f, s)
+    else
+        _affect = getfield(f, :affect!)
+        return getfield(_affect, s)
+    end
+end
+
+function Base.setproperty!(f::TrackedAffect, s::Symbol, value)
+    if hasfield(TrackedAffect, s)
+        return setfield!(f, s, value)
+    else
+        _affect = getfield(f, :affect!)
+        return setfield!(_affect, s, value)
+    end
 end
 
 function (f::TrackedAffect)(integrator, event_idx = nothing)
@@ -104,34 +132,34 @@ end
 function _track_callback(cb::DiscreteCallback, t, u, p, sensealg)
     correction = ImplicitCorrection(cb, t, u, p, sensealg)
     DiscreteCallback(cb.condition,
-                     TrackedAffect(t, u, p, cb.affect!, correction),
-                     cb.initialize,
-                     cb.finalize,
-                     cb.save_positions)
+        TrackedAffect(t, u, p, cb.affect!, correction),
+        cb.initialize,
+        cb.finalize,
+        cb.save_positions)
 end
 
 function _track_callback(cb::ContinuousCallback, t, u, p, sensealg)
     correction = ImplicitCorrection(cb, t, u, p, sensealg)
     ContinuousCallback(cb.condition,
-                       TrackedAffect(t, u, p, cb.affect!, correction),
-                       TrackedAffect(t, u, p, cb.affect_neg!, correction),
-                       cb.initialize,
-                       cb.finalize,
-                       cb.idxs,
-                       cb.rootfind, cb.interp_points,
-                       cb.save_positions,
-                       cb.dtrelax, cb.abstol, cb.reltol, cb.repeat_nudge)
+        TrackedAffect(t, u, p, cb.affect!, correction),
+        TrackedAffect(t, u, p, cb.affect_neg!, correction),
+        cb.initialize,
+        cb.finalize,
+        cb.idxs,
+        cb.rootfind, cb.interp_points,
+        cb.save_positions,
+        cb.dtrelax, cb.abstol, cb.reltol, cb.repeat_nudge)
 end
 
 function _track_callback(cb::VectorContinuousCallback, t, u, p, sensealg)
     correction = ImplicitCorrection(cb, t, u, p, sensealg)
     VectorContinuousCallback(cb.condition,
-                             TrackedAffect(t, u, p, cb.affect!, correction),
-                             TrackedAffect(t, u, p, cb.affect_neg!, correction),
-                             cb.len, cb.initialize, cb.finalize, cb.idxs,
-                             cb.rootfind, cb.interp_points,
-                             collect(cb.save_positions),
-                             cb.dtrelax, cb.abstol, cb.reltol, cb.repeat_nudge)
+        TrackedAffect(t, u, p, cb.affect!, correction),
+        TrackedAffect(t, u, p, cb.affect_neg!, correction),
+        cb.len, cb.initialize, cb.finalize, cb.idxs,
+        cb.rootfind, cb.interp_points,
+        collect(cb.save_positions),
+        cb.dtrelax, cb.abstol, cb.reltol, cb.repeat_nudge)
 end
 
 struct FakeIntegrator{uType, P, tType, tprevType}
@@ -141,8 +169,13 @@ struct FakeIntegrator{uType, P, tType, tprevType}
     tprev::tprevType
 end
 
+function Base.getproperty(fi::FakeIntegrator, s::Symbol)
+    s === :tdir && return sign(fi.t - fi.tprev)
+    return getfield(fi, s)
+end
+
 struct CallbackSensitivityFunction{fType, Alg <: AbstractOverloadingSensitivityAlgorithm,
-                                   C <: AdjointDiffCache, pType} <: SensitivityFunction
+    C <: AdjointDiffCache, pType} <: SensitivityFunction
     f::fType
     sensealg::Alg
     diffcache::C
@@ -163,32 +196,35 @@ function setup_reverse_callbacks(cb, sensealg, dgdu, dgdp, cur_time, terminated)
     setup_reverse_callbacks(CallbackSet(cb), sensealg, dgdu, dgdp, cur_time, terminated)
 end
 function setup_reverse_callbacks(cb::CallbackSet, sensealg, dgdu, dgdp, cur_time,
-                                 terminated)
-    cb = CallbackSet(_setup_reverse_callbacks.(cb.continuous_callbacks,
-                                               (sensealg,),
-                                               (dgdu,),
-                                               (dgdp,),
-                                               (cur_time,), (terminated,))...,
-                     reverse(_setup_reverse_callbacks.(cb.discrete_callbacks,
-                                                       (sensealg,),
-                                                       (dgdu,),
-                                                       (dgdp,), (cur_time,), (terminated,)))...)
+        terminated)
+    cb = CallbackSet(
+        _setup_reverse_callbacks.(cb.continuous_callbacks,
+            (sensealg,),
+            (dgdu,),
+            (dgdp,),
+            (cur_time,), (terminated,))...,
+        reverse(_setup_reverse_callbacks.(cb.discrete_callbacks,
+            (sensealg,),
+            (dgdu,),
+            (dgdp,), (cur_time,), (terminated,)))...)
     return cb
 end
 
-function _setup_reverse_callbacks(cb::Union{ContinuousCallback, DiscreteCallback,
-                                            VectorContinuousCallback}, sensealg,
-                                  dgdu,
-                                  dgdp,
-                                  loss_ref, terminated)
+function _setup_reverse_callbacks(
+        cb::Union{ContinuousCallback, DiscreteCallback,
+            VectorContinuousCallback}, sensealg,
+        dgdu,
+        dgdp,
+        loss_ref, terminated)
     _setup_reverse_callbacks(cb, cb.affect!, sensealg, dgdu, dgdp, loss_ref, terminated)
 end
 
-function _setup_reverse_callbacks(cb::Union{ContinuousCallback, DiscreteCallback,
-                                            VectorContinuousCallback},
-                                  affect::TrackedAffect, sensealg, dgdu,
-                                  dgdp,
-                                  loss_ref, terminated)
+function _setup_reverse_callbacks(
+        cb::Union{ContinuousCallback, DiscreteCallback,
+            VectorContinuousCallback},
+        affect::TrackedAffect, sensealg, dgdu,
+        dgdp,
+        loss_ref, terminated)
     if cb isa Union{ContinuousCallback, VectorContinuousCallback} && cb.affect! !== nothing
         cb.affect!.correction.cur_time = loss_ref # set cur_time
         cb.affect!.correction.terminated = terminated # flag if time evolution was terminated by callback
@@ -202,14 +238,14 @@ function _setup_reverse_callbacks(cb::Union{ContinuousCallback, DiscreteCallback
     # if save_positions = [1,1] is true the loss gradient is accumulated correctly before and after callback.
     # if save_positions = [0,0] no extra gradient is added.
     # if save_positions = [0,1] the gradient contribution is added before the callback but no additional gradient is added afterwards.
-    # if save_positions = [1,0] the gradient contribution is added before, and in principle we would need to correct the adjoint state again. Thefore,
+    # if save_positions = [1,0] the gradient contribution is added before, and in principle we would need to correct the adjoint state again. Therefore,
 
     cb.save_positions == [1, 0] && error("save_positions=[1,0] is currently not supported.")
     !(sensealg.autojacvec isa Union{ReverseDiffVJP, EnzymeVJP}) &&
         error("Only `ReverseDiffVJP` and `EnzymeVJP` are currently compatible with continuous adjoint sensitivity methods for hybrid DEs. Please select `ReverseDiffVJP` or `EnzymeVJP` as `autojacvec`.")
 
     # event times
-    times = if typeof(cb) <: DiscreteCallback
+    times = if cb isa DiscreteCallback
         cb.affect!.event_times
     else
         [cb.affect!.event_times; cb.affect_neg!.event_times]
@@ -239,8 +275,8 @@ function _setup_reverse_callbacks(cb::Union{ContinuousCallback, DiscreteCallback
         # if save_positions[2] = false, then the right limit is not saved. Thus, for
         # the QuadratureAdjoint we would need to lift y from the left to the right limit.
         # However, one also needs to update dgrad later on.
-        if (sensealg isa QuadratureAdjoint && !cb.save_positions[2]) # || (sensealg isa InterpolatingAdjoint && ischeckpointing(sensealg))
-            # lifting for InterpolatingAdjoint is not needed anymore. Callback is already applied.
+        if (sensealg isa QuadratureAdjoint && !cb.save_positions[2]) ||
+           (sensealg isa InterpolatingAdjoint && ischeckpointing(sensealg))
             w(y, y, integrator.p, integrator.t)
         end
 
@@ -249,8 +285,8 @@ function _setup_reverse_callbacks(cb::Union{ContinuousCallback, DiscreteCallback
             # wrt dependence of event time t on parameters and initial state.
             # Must be handled here because otherwise it is unclear if continuous or
             # discrete callback was triggered.
-            @unpack correction = cb.affect!
-            @unpack dy_right, Lu_right = correction
+            (; correction) = cb.affect!
+            (; dy_right, Lu_right) = correction
             # compute #f(xτ_right,p_right,τ(x₀,p))
             compute_f!(dy_right, S, y, integrator)
             # if callback did not terminate the time evolution, we have to compute one more correction term.
@@ -262,18 +298,22 @@ function _setup_reverse_callbacks(cb::Union{ContinuousCallback, DiscreteCallback
             end
         end
 
-        update_p = copy_to_integrator!(cb, y, integrator.p, integrator.t, indx, pos_neg)
-        # reshape u and du (y and dy) to match forward pass (e.g., for matrices as initial conditions). Only needed for BacksolveAdjoint
+        update_p = copy_to_integrator!(cb, y, integrator.p, indx, pos_neg)
+
         if sensealg isa BacksolveAdjoint
-            _size = pos_neg ? size(cb.affect!.uleft[indx]) :
-                    size(cb.affect_neg!.uleft[indx])
-            y = reshape(y, _size)
-            dy = reshape(dy, _size)
+            # reshape u and du (y and dy) to match forward pass (e.g., for matrices as initial conditions). Only needed for BacksolveAdjoint
+            _y = S.y
+            if eltype(y) <: ForwardDiff.Dual # handle implicit solvers
+                copyto!(vec(_y), ForwardDiff.value.(y))
+            else
+                copyto!(vec(_y), y)
+            end
+            y = _y
         end
 
         if cb isa Union{ContinuousCallback, VectorContinuousCallback}
             # compute the correction of the right limit (with left state limit inserted into dgdt)
-            @unpack dy_left, cur_time = correction
+            (; dy_left, cur_time) = correction
             compute_f!(dy_left, S, y, integrator)
             dgdt(dy_left, correction, sensealg, y, integrator, tprev, event_idx)
             if !correction.terminated
@@ -288,20 +328,21 @@ function _setup_reverse_callbacks(cb::Union{ContinuousCallback, DiscreteCallback
                 # reinit diffcache struct
                 #diffcache(t2)
                 fakeSp = CallbackSensitivityFunction(wp, sensealg, diffcaches[2],
-                                                     integrator.sol.prob)
+                    integrator.sol.prob)
                 #vjp with Jacobin given by dw/dp before event and vector given by grad
                 vecjacobian!(dgrad, integrator.p, grad, y, integrator.t, fakeSp;
-                             dgrad = nothing, dy = nothing)
+                    dgrad = nothing, dy = nothing)
                 grad .= dgrad
             end
         end
+
         vecjacobian!(dλ, y, λ, integrator.p, integrator.t, fakeS;
-                     dgrad = dgrad, dy = dy)
+            dgrad = dgrad, dy = dy)
 
         dgrad !== nothing && (dgrad .*= -1)
         if cb isa Union{ContinuousCallback, VectorContinuousCallback}
             # second correction to correct for left limit
-            @unpack Lu_left = correction
+            (; Lu_left) = correction
             implicit_correction!(Lu_left, dλ, dy_left, correction)
             dλ .+= Lu_left - Lu_right
 
@@ -309,8 +350,8 @@ function _setup_reverse_callbacks(cb::Union{ContinuousCallback, DiscreteCallback
                 # if the callback saved the first position, we need to implicitly correct this value as well
                 loss_indx = correction.cur_time[]
                 implicit_correction!(Lu_left, dy_left, correction, y, integrator, dgdu,
-                                     dgdp,
-                                     loss_indx)
+                    dgdp,
+                    loss_indx)
                 dλ .+= Lu_left
             end
         end
@@ -323,22 +364,24 @@ function _setup_reverse_callbacks(cb::Union{ContinuousCallback, DiscreteCallback
     end
 
     PresetTimeCallback(times,
-                       affect!,
-                       save_positions = (false, false))
+        affect!,
+        save_positions = (false, false))
 end
 
-function _setup_reverse_callbacks(cb::Union{ContinuousCallback, DiscreteCallback,
-                                            VectorContinuousCallback}, affect, sensealg,
-                                  dgdu,
-                                  dgdp,
-                                  loss_ref, terminated)
+function _setup_reverse_callbacks(
+        cb::Union{ContinuousCallback, DiscreteCallback,
+            VectorContinuousCallback},
+        affect, sensealg,
+        dgdu,
+        dgdp,
+        loss_ref, terminated)
     # return cb if affect is not a TrackedAffect
     cb
 end
 
 function setup_w_wp(cb::Union{DiscreteCallback, ContinuousCallback},
-                    autojacvec::Union{ReverseDiffVJP, EnzymeVJP}, pos_neg, event_idx,
-                    tprev)
+        autojacvec::Union{ReverseDiffVJP, EnzymeVJP}, pos_neg, event_idx,
+        tprev)
     w = let tprev = tprev, pos_neg = pos_neg
         function (du, u, p, t)
             _affect! = get_affect!(cb, pos_neg)
@@ -362,8 +405,8 @@ function setup_w_wp(cb::Union{DiscreteCallback, ContinuousCallback},
 end
 
 function setup_w_wp(cb::VectorContinuousCallback,
-                    autojacvec::Union{ReverseDiffVJP, EnzymeVJP}, pos_neg, event_idx,
-                    tprev)
+        autojacvec::Union{ReverseDiffVJP, EnzymeVJP}, pos_neg, event_idx,
+        tprev)
     w = let tprev = tprev, pos_neg = pos_neg, event_idx = event_idx
         function (du, u, p, t)
             _affect! = get_affect!(cb, pos_neg)
@@ -391,8 +434,10 @@ function get_FakeIntegrator(autojacvec::ReverseDiffVJP, u, p, t, tprev)
 end
 get_FakeIntegrator(autojacvec::EnzymeVJP, u, p, t, tprev) = FakeIntegrator(u, p, t, tprev)
 
-function get_cb_diffcaches(cb::Union{DiscreteCallback, ContinuousCallback,
-                                     VectorContinuousCallback}, autojacvec)
+function get_cb_diffcaches(
+        cb::Union{DiscreteCallback, ContinuousCallback,
+            VectorContinuousCallback},
+        autojacvec)
     _dc = []
     if cb isa DiscreteCallback
         pos_negs = (true,)
@@ -421,26 +466,32 @@ function get_cb_diffcaches(cb::Union{DiscreteCallback, ContinuousCallback,
                 w, wp = setup_w_wp(cb, autojacvec, pos_neg, event_idx, _t)
 
                 paramjac_config = get_paramjac_config(autojacvec, _p, w, y, _p, _t;
-                                                      numindvar = length(y), alg = nothing,
-                                                      isinplace = true, isRODE = false,
-                                                      _W = nothing)
+                    numindvar = length(y), alg = nothing,
+                    isinplace = true, isRODE = false,
+                    _W = nothing)
                 pf = get_pf(autojacvec; _f = w, isinplace = true, isRODE = false)
+                if autojacvec isa EnzymeVJP
+                    paramjac_config = (paramjac_config..., Enzyme.make_zero(pf))
+                end
 
                 diffcache_w = AdjointDiffCache(nothing, pf, nothing, nothing, nothing,
-                                               nothing, nothing, nothing, paramjac_config,
-                                               nothing, nothing, nothing, nothing, nothing,
-                                               nothing, nothing, nothing, false)
+                    nothing, nothing, nothing, paramjac_config,
+                    nothing, nothing, nothing, nothing, nothing,
+                    nothing, nothing, nothing, false)
 
                 paramjac_config = get_paramjac_config(autojacvec, y, wp, _p, y, _t;
-                                                      numindvar = length(y), alg = nothing,
-                                                      isinplace = true, isRODE = false,
-                                                      _W = nothing)
+                    numindvar = length(y), alg = nothing,
+                    isinplace = true, isRODE = false,
+                    _W = nothing)
                 pf = get_pf(autojacvec; _f = wp, isinplace = true, isRODE = false)
+                if autojacvec isa EnzymeVJP
+                    paramjac_config = (paramjac_config..., Enzyme.make_zero(pf))
+                end
 
                 diffcache_wp = AdjointDiffCache(nothing, pf, nothing, nothing, nothing,
-                                                nothing, nothing, nothing, paramjac_config,
-                                                nothing, nothing, nothing, nothing, nothing,
-                                                nothing, nothing, nothing, false)
+                    nothing, nothing, nothing, paramjac_config,
+                    nothing, nothing, nothing, nothing, nothing,
+                    nothing, nothing, nothing, false)
 
                 push!(_dc, (pos_neg, event_idx) => (diffcache_w, diffcache_wp))
             end
@@ -458,7 +509,8 @@ function get_indx(cb::Union{ContinuousCallback, VectorContinuousCallback}, t)
            cb.affect!.event_times[min(indx, length(cb.affect!.event_times))] == t
             return indx, true
         elseif !isempty(cb.affect_neg!.event_times) &&
-               cb.affect_neg!.event_times[min(indx_neg, length(cb.affect_neg!.event_times))] ==
+               cb.affect_neg!.event_times[min(indx_neg,
+            length(cb.affect_neg!.event_times))] ==
                t
             return indx_neg, false
         else
@@ -486,15 +538,20 @@ function get_event_idx(cb::VectorContinuousCallback, indx, bool)
     end
 end
 
-function copy_to_integrator!(cb::DiscreteCallback, y, p, t, indx, bool)
+function copy_to_integrator!(cb::DiscreteCallback, y, p, indx, bool)
+    # For BacksolveAdjoint, y is a view to the integrator state;
+    # for the other methods, it's the S.y cache
     copyto!(y, cb.affect!.uleft[indx])
     update_p = (p != cb.affect!.pleft[indx])
     update_p && copyto!(p, cb.affect!.pleft[indx])
     update_p
 end
 
-function copy_to_integrator!(cb::Union{ContinuousCallback, VectorContinuousCallback}, y, p,
-                             t, indx, bool)
+function copy_to_integrator!(cb::Union{ContinuousCallback, VectorContinuousCallback},
+        y,
+        p,
+        indx,
+        bool)
     if bool
         copyto!(y, cb.affect!.uleft[indx])
         update_p = (p != cb.affect!.pleft[indx])
@@ -520,7 +577,7 @@ end
 
 function dgdt(dy, correction, sensealg, y, integrator, tprev, event_idx)
     # dy refers to f evaluated on left limit
-    @unpack gt_val, gu_val, gt, gu, gt_conf, gu_conf, condition = correction
+    (; gt_val, gu_val, gt, gu, gt_conf, gu_conf, condition) = correction
 
     p, t = integrator.p, integrator.t
 
@@ -564,7 +621,7 @@ function loss_correction!(Lu, y, integrator, dgdu, dgdp, indx)
 end
 
 function implicit_correction!(Lu, dλ, λ, dy, correction)
-    @unpack gu_val = correction
+    (; gu_val) = correction
 
     # remove gradients from adjoint state to compute correction factor
     @. dλ = λ - Lu
@@ -574,7 +631,7 @@ function implicit_correction!(Lu, dλ, λ, dy, correction)
 end
 
 function implicit_correction!(Lu, λ, dy, correction)
-    @unpack gu_val = correction
+    (; gu_val) = correction
 
     Lu .= dot(λ, dy) * gu_val
 
@@ -582,7 +639,7 @@ function implicit_correction!(Lu, λ, dy, correction)
 end
 
 function implicit_correction!(Lu, dy, correction, y, integrator, dgdu, dgdp, indx)
-    @unpack gu_val = correction
+    (; gu_val) = correction
 
     p, t = integrator.p, integrator.t
 
@@ -606,6 +663,7 @@ function build_condition_wrappers(cb::ContinuousCallback, condition, u, t, fakei
 end
 function build_condition_wrappers(cb::VectorContinuousCallback, condition, u, t, fakeinteg)
     out = similar(u, cb.len) # create a cache for condition function (out,u,t,integrator)
+    out .= 0
     gt = VectorConditionTimeWrapper(condition, u, fakeinteg, 1, out)
     gu = VectorConditionUWrapper(condition, t, fakeinteg, 1, out)
     return gt, gu
@@ -630,7 +688,11 @@ mutable struct VectorConditionTimeWrapper{F, uType, Integrator, outType} <: Func
     out_cache::outType
 end
 function (ff::VectorConditionTimeWrapper)(t)
-    (ff.f(ff.out_cache, ff.u, t, ff.integrator); [ff.out_cache[ff.event_idx]])
+    (out = zeros(typeof(t), length(ff.out_cache));
+    ff.f(out, ff.u, t, ff.integrator);
+    [
+        out[ff.event_idx]
+    ])
 end
 
 mutable struct VectorConditionUWrapper{F, tType, Integrator, outType} <: Function

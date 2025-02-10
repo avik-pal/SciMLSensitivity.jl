@@ -40,14 +40,15 @@ In the following example, a discrete exogenous input signal `ex` is defined and
 used as an input into the neural network of a neural ODE system.
 
 ```@example exogenous
-using DifferentialEquations, Lux, ComponentArrays, DiffEqFlux, Optimization,
-      OptimizationPolyalgorithms, OptimizationFlux, Plots, Random
+using SciMLSensitivity
+using OrdinaryDiffEq, Lux, ComponentArrays, Optimization,
+      OptimizationPolyalgorithms, OptimizationOptimisers, Plots, Random
 
 rng = Random.default_rng()
-tspan = (0.1f0, Float32(10.0))
+tspan = (0.1, 10.0)
 tsteps = range(tspan[1], tspan[2], length = 100)
 t_vec = collect(tsteps)
-ex = vec(ones(Float32, length(tsteps), 1))
+ex = vec(ones(Float64, length(tsteps), 1))
 f(x) = (atan(8.0 * x - 4.0) + atan(4.0)) / (2.0 * atan(4.0))
 
 function hammerstein_system(u)
@@ -58,13 +59,13 @@ function hammerstein_system(u)
     return y
 end
 
-y = Float32.(hammerstein_system(ex))
+y = hammerstein_system(ex)
 plot(collect(tsteps), y, ticks = :native)
 
 nn_model = Lux.Chain(Lux.Dense(2, 8, tanh), Lux.Dense(8, 1))
 p_model, st = Lux.setup(rng, nn_model)
 
-u0 = Float32.([0.0])
+u0 = Float64.([0.0])
 
 function dudt(u, p, t)
     global st
@@ -88,7 +89,7 @@ end
 
 adtype = Optimization.AutoZygote()
 optf = Optimization.OptimizationFunction((x, p) -> loss(x), adtype)
-optprob = Optimization.OptimizationProblem(optf, ComponentArray(p_model))
+optprob = Optimization.OptimizationProblem(optf, ComponentArray{Float64}(p_model))
 
 res0 = Optimization.solve(optprob, PolyOpt(), maxiters = 100)
 
@@ -97,5 +98,3 @@ plot(tsteps, sol')
 N = length(sol)
 scatter!(tsteps, y[1:N])
 ```
-
-![](https://aws1.discourse-cdn.com/business5/uploads/julialang/original/3X/f/3/f3c2727af36ac20e114fe3c9798e567cc9d22b9e.png)

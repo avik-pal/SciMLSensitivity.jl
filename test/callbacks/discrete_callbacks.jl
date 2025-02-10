@@ -23,9 +23,9 @@ function test_discrete_callback(cb, tstops, g, dg!, cboop = nothing, tprev = fal
     proboop = ODEProblem(foop, u0, (0.0, 10.0), p)
 
     sol1 = solve(prob, Tsit5(), u0 = u0, p = p, callback = cb, tstops = tstops,
-                 abstol = abstol, reltol = reltol, saveat = savingtimes)
+        abstol = abstol, reltol = reltol, saveat = savingtimes)
     sol2 = solve(prob, Tsit5(), u0 = u0, p = p, tstops = tstops, abstol = abstol,
-                 reltol = reltol, saveat = savingtimes)
+        reltol = reltol, saveat = savingtimes)
 
     if cb.save_positions == [1, 1]
         @test length(sol1.t) != length(sol2.t)
@@ -33,69 +33,78 @@ function test_discrete_callback(cb, tstops, g, dg!, cboop = nothing, tprev = fal
         @test length(sol1.t) == length(sol2.t)
     end
 
-    du01, dp1 = Zygote.gradient((u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
-                                                   callback = cb, tstops = tstops,
-                                                   abstol = abstol, reltol = reltol,
-                                                   saveat = savingtimes,
-                                                   sensealg = BacksolveAdjoint())),
-                                u0, p)
+    du01, dp1 = Zygote.gradient(
+        (u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
+            callback = cb, tstops = tstops,
+            abstol = abstol, reltol = reltol,
+            saveat = savingtimes,
+            sensealg = BacksolveAdjoint())),
+        u0, p)
 
-    du01b, dp1b = Zygote.gradient((u0, p) -> g(solve(proboop, Tsit5(), u0 = u0, p = p,
-                                                     callback = cb, tstops = tstops,
-                                                     abstol = abstol, reltol = reltol,
-                                                     saveat = savingtimes,
-                                                     sensealg = BacksolveAdjoint())),
-                                  u0, p)
+    du01b, dp1b = Zygote.gradient(
+        (u0, p) -> g(solve(proboop, Tsit5(), u0 = u0, p = p,
+            callback = cb, tstops = tstops,
+            abstol = abstol, reltol = reltol,
+            saveat = savingtimes,
+            sensealg = BacksolveAdjoint())),
+        u0, p)
 
-    du01c, dp1c = Zygote.gradient((u0, p) -> g(solve(proboop, Tsit5(), u0 = u0, p = p,
-                                                     callback = cb, tstops = tstops,
-                                                     abstol = abstol, reltol = reltol,
-                                                     saveat = savingtimes,
-                                                     sensealg = BacksolveAdjoint(checkpointing = false))),
-                                  u0, p)
+    du01c, dp1c = Zygote.gradient(
+        (u0, p) -> g(solve(proboop, Tsit5(), u0 = u0, p = p,
+            callback = cb, tstops = tstops,
+            abstol = abstol, reltol = reltol,
+            saveat = savingtimes,
+            sensealg = BacksolveAdjoint(checkpointing = false))),
+        u0, p)
 
     if cboop === nothing
-        du02, dp2 = Zygote.gradient((u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
-                                                       callback = cb, tstops = tstops,
-                                                       abstol = abstol, reltol = reltol,
-                                                       saveat = savingtimes,
-                                                       sensealg = ReverseDiffAdjoint())),
-                                    u0, p)
+        du02, dp2 = Zygote.gradient(
+            (u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
+                callback = cb, tstops = tstops,
+                abstol = abstol, reltol = reltol,
+                saveat = savingtimes,
+                sensealg = ReverseDiffAdjoint())),
+            u0, p)
     else
-        du02, dp2 = Zygote.gradient((u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
-                                                       callback = cboop, tstops = tstops,
-                                                       abstol = abstol, reltol = reltol,
-                                                       saveat = savingtimes,
-                                                       sensealg = ReverseDiffAdjoint())),
-                                    u0, p)
+        du02, dp2 = Zygote.gradient(
+            (u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
+                callback = cboop, tstops = tstops,
+                abstol = abstol, reltol = reltol,
+                saveat = savingtimes,
+                sensealg = ReverseDiffAdjoint())),
+            u0, p)
     end
 
-    du03, dp3 = Zygote.gradient((u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
-                                                   callback = cb, tstops = tstops,
-                                                   abstol = abstol, reltol = reltol,
-                                                   saveat = savingtimes,
-                                                   sensealg = InterpolatingAdjoint(checkpointing = true))),
-                                u0, p)
+    du03, dp3 = Zygote.gradient(
+        (u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
+            callback = cb, tstops = tstops,
+            abstol = abstol, reltol = reltol,
+            saveat = savingtimes,
+            sensealg = InterpolatingAdjoint(checkpointing = true))),
+        u0, p)
 
-    du03c, dp3c = Zygote.gradient((u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
-                                                     callback = cb, tstops = tstops,
-                                                     abstol = abstol, reltol = reltol,
-                                                     saveat = savingtimes,
-                                                     sensealg = InterpolatingAdjoint(checkpointing = false))),
-                                  u0, p)
+    du03c, dp3c = Zygote.gradient(
+        (u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
+            callback = cb, tstops = tstops,
+            abstol = abstol, reltol = reltol,
+            saveat = savingtimes,
+            sensealg = InterpolatingAdjoint(checkpointing = false))),
+        u0, p)
 
-    du04, dp4 = Zygote.gradient((u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
-                                                   callback = cb, tstops = tstops,
-                                                   abstol = abstol, reltol = reltol,
-                                                   saveat = savingtimes,
-                                                   sensealg = QuadratureAdjoint())),
-                                u0, p)
+    du04, dp4 = Zygote.gradient(
+        (u0, p) -> g(solve(prob, Tsit5(), u0 = u0, p = p,
+            callback = cb, tstops = tstops,
+            abstol = abstol, reltol = reltol,
+            saveat = savingtimes,
+            sensealg = QuadratureAdjoint())),
+        u0, p)
 
-    dstuff = ForwardDiff.gradient((θ) -> g(solve(prob, Tsit5(), u0 = θ[1:2], p = θ[3:6],
-                                                 callback = cb, tstops = tstops,
-                                                 abstol = abstol, reltol = reltol,
-                                                 saveat = savingtimes)),
-                                  [u0; p])
+    dstuff = ForwardDiff.gradient(
+        (θ) -> g(solve(prob, Tsit5(), u0 = θ[1:2], p = θ[3:6],
+            callback = cb, tstops = tstops,
+            abstol = abstol, reltol = reltol,
+            saveat = savingtimes)),
+        [u0; p])
 
     @info dstuff
 
@@ -131,16 +140,17 @@ function test_discrete_callback(cb, tstops, g, dg!, cboop = nothing, tprev = fal
     @test dp1≈dp4 rtol=1e-7
 
     cb2 = SciMLSensitivity.track_callbacks(CallbackSet(cb), prob.tspan[1], prob.u0, prob.p,
-                                           BacksolveAdjoint(autojacvec = ReverseDiffVJP()))
+        BacksolveAdjoint(autojacvec = ReverseDiffVJP()))
     sol_track = solve(prob, Tsit5(), u0 = u0, p = p, callback = cb2, tstops = tstops,
-                      abstol = abstol, reltol = reltol, saveat = savingtimes)
+        abstol = abstol, reltol = reltol, saveat = savingtimes)
     #cb_adj = SciMLSensitivity.setup_reverse_callbacks(cb2,BacksolveAdjoint())
 
-    adj_prob = ODEAdjointProblem(sol_track, BacksolveAdjoint(autojacvec = ReverseDiffVJP()),
-                                 Tsit5(),
-                                 sol_track.t, dg!,
-                                 callback = cb2,
-                                 abstol = abstol, reltol = reltol)
+    adj_prob = ODEAdjointProblem(
+        sol_track, BacksolveAdjoint(autojacvec = ReverseDiffVJP()),
+        Tsit5(),
+        sol_track.t, dg!,
+        callback = cb2,
+        abstol = abstol, reltol = reltol)
     adj_sol = solve(adj_prob, Tsit5(), abstol = abstol, reltol = reltol)
     @test du01 ≈ adj_sol[1:2, end]
     @test dp1 ≈ adj_sol[3:6, end]
@@ -212,8 +222,8 @@ end
                 condition(u, t, integrator) = t == 5
                 function affect!(integrator)
                     (@show integrator.tprev;
-                     integrator.u[1] += integrator.t -
-                                        integrator.tprev)
+                    integrator.u[1] += integrator.t -
+                                       integrator.tprev)
                 end
                 cb = DiscreteCallback(condition, affect!)
                 tstops = [4.999, 5.0]
@@ -280,13 +290,38 @@ end
                 condition(u, t, integrator) = t == 5
                 function affect!(integrator)
                     (@show integrator.tprev;
-                     integrator.u[1] += integrator.t -
-                                        integrator.tprev)
+                    integrator.u[1] += integrator.t -
+                                       integrator.tprev)
                 end
                 cb = DiscreteCallback(condition, affect!)
                 tstops = [4.999, 5.0]
                 test_discrete_callback(cb, tstops, g, dg!, nothing, true)
             end
+        end
+        @testset "Dosing example" begin
+            N0 = [0.0] # initial population
+            p = [100.0, 50.0] # steady-state pop., M
+            tspan = (0.0, 10.0) # integration time
+            f(D, u, p, t) = (D[1] = p[1] - u[1]) # system
+            prob = ODEProblem(f, N0, tspan, p)
+
+            # at time tinject1 we inject M1 cells
+            tinject = 8.0
+            condition(u, t, integrator) = t == tinject
+            affect(integrator) = integrator.u[1] += integrator.p[2]
+            cb = DiscreteCallback(condition, affect)
+
+            function loss(p)
+                _prob = remake(prob, p = p)
+                _sol = solve(_prob, Tsit5(); callback = cb,
+                    abstol = 1e-14, reltol = 1e-14, tstops = [tinject],
+                    sensealg = BacksolveAdjoint(autojacvec = EnzymeVJP()))
+                _sol.u[end][1]
+            end
+
+            gFD = ForwardDiff.gradient(loss, p)
+            gZy = Zygote.gradient(loss, p)[1]
+            @test gFD ≈ gZy
         end
     end
 end

@@ -41,8 +41,7 @@ Pkg.add("SciMLSensitivity")
 The highest level interface is provided by the function `solve`:
 
 ```julia
-solve(prob, args...; sensealg = InterpolatingAdjoint(),
-      checkpoints = sol.t, kwargs...)
+solve(prob, args...; sensealg = InterpolatingAdjoint(), checkpoints = sol.t, kwargs...)
 ```
 
 `solve` is fully compatible with automatic differentiation libraries
@@ -163,10 +162,10 @@ Many training techniques are supported by this package, including:
   - O(1) memory backprop of ODEs via BacksolveAdjoint, and Virtual Brownian Trees for O(1) backprop of SDEs
   - [Continuous adjoints for integral loss functions](@ref continuous_loss)
   - Probabilistic programming and variational inference on ODEs/SDEs/DAEs/DDEs/hybrid
-    equations etc. is provided by integration with [Turing.jl](https://turing.ml/stable/docs/using-turing/)
+    equations etc. is provided by integration with [Turing.jl](https://turinglang.org/v0.29/docs/using-turing/get-started)
     and [Gen.jl](https://github.com/probcomp/Gen.jl). Reproduce
     [variational loss functions](https://arxiv.org/abs/2001.01328) by plugging
-    [composable libraries together](https://turing.ml/stable/tutorials/09-variational-inference/).
+    [composable libraries together](https://turinglang.org/v0.29/tutorials/09-variational-inference/).
 
 all while mixing forward mode and reverse mode approaches as appropriate for the
 most speed. For more details on the adjoint sensitivity analysis methods for
@@ -195,7 +194,7 @@ use and swap out the ODE solver between any common interface compatible library,
   - [… etc. many other choices!](https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/)
 
 In addition, due to the composability of the system, none of the components are directly
-tied to the Flux.jl machine learning framework. For example, you can [use SciMLSensitivity.jl
+tied to the Lux.jl machine learning framework. For example, you can [use SciMLSensitivity.jl
 to generate TensorFlow graphs and train the neural network with TensorFlow.jl](https://youtu.be/n2MwJ1guGVQ?t=284),
 [use PyTorch arrays via Torch.jl](https://github.com/FluxML/Torch.jl), and more all with
 single line code changes by utilizing the underlying code generation. The tutorials shown here
@@ -279,32 +278,19 @@ Pkg.status(; mode = PKGMODE_MANIFEST) # hide
 </details>
 ```
 
-```@raw html
-You can also download the 
-<a href="
-```
-
 ```@eval
 using TOML
+using Markdown
 version = TOML.parse(read("../../Project.toml", String))["version"]
 name = TOML.parse(read("../../Project.toml", String))["name"]
-link = "https://github.com/SciML/" * name * ".jl/tree/gh-pages/v" * version *
-       "/assets/Manifest.toml"
-```
-
-```@raw html
-">manifest</a> file and the
-<a href="
-```
-
-```@eval
-using TOML
-version = TOML.parse(read("../../Project.toml", String))["version"]
-name = TOML.parse(read("../../Project.toml", String))["name"]
-link = "https://github.com/SciML/" * name * ".jl/tree/gh-pages/v" * version *
-       "/assets/Project.toml"
-```
-
-```@raw html
-">project</a> file.
+link_manifest = "https://github.com/SciML/" * name * ".jl/tree/gh-pages/v" * version *
+                "/assets/Manifest.toml"
+link_project = "https://github.com/SciML/" * name * ".jl/tree/gh-pages/v" * version *
+               "/assets/Project.toml"
+Markdown.parse("""You can also download the
+[manifest]($link_manifest)
+file and the
+[project]($link_project)
+file.
+""")
 ```

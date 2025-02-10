@@ -1,6 +1,6 @@
 # for Ito / Stratonovich conversion
-struct StochasticTransformedFunction{pType, fType <: DiffEqBase.AbstractDiffEqFunction,
-                                     gType, noiseType, cfType} <: TransformedFunction
+struct StochasticTransformedFunction{pType, fType <: AbstractDiffEqFunction,
+    gType, noiseType, cfType} <: TransformedFunction
     prob::pType
     f::fType
     g::gType
@@ -10,20 +10,20 @@ struct StochasticTransformedFunction{pType, fType <: DiffEqBase.AbstractDiffEqFu
 end
 
 function StochasticTransformedFunction(sol, f, g, corfunc_analytical = nothing)
-    @unpack prob = sol
+    (; prob) = sol
 
-    if StochasticDiffEq.is_diagonal_noise(prob)
+    if SciMLBase.is_diagonal_noise(prob)
         gtmp = copy(sol.u[end])
     else
         gtmp = similar(prob.p, size(prob.noise_rate_prototype))
     end
 
     return StochasticTransformedFunction(prob, f, g, gtmp, DiffEqBase.isinplace(prob),
-                                         corfunc_analytical)
+        corfunc_analytical)
 end
 
 function (Tfunc::StochasticTransformedFunction)(du, u, p, t)
-    @unpack gtmp, f, g, corfunc_analytical = Tfunc
+    (; gtmp, f, g, corfunc_analytical) = Tfunc
 
     ducor = similar(u, size(u))
 
@@ -62,7 +62,7 @@ function (Tfunc::StochasticTransformedFunction)(du, u, p, t)
 end
 
 function (Tfunc::StochasticTransformedFunction)(u, p, t)
-    @unpack f, g, corfunc_analytical = Tfunc
+    (; f, g, corfunc_analytical) = Tfunc
     #ducor = vecjacobian(u, p, t, Tfunc)
 
     if corfunc_analytical !== nothing
