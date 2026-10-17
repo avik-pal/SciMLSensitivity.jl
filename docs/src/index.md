@@ -32,7 +32,7 @@ Thus, what SciMLSensitivity.jl provides is:
 To install SciMLSensitivity.jl, use the Julia package manager:
 
 ```julia
-using Pkg
+import Pkg
 Pkg.add("SciMLSensitivity")
 ```
 
@@ -41,13 +41,16 @@ Pkg.add("SciMLSensitivity")
 The highest level interface is provided by the function `solve`:
 
 ```julia
-solve(prob, args...; sensealg = InterpolatingAdjoint(),
-      checkpoints = sol.t, kwargs...)
+import SciMLSensitivity as SMS
+
+solve(prob, args...; sensealg = SMS.InterpolatingAdjoint(), checkpoints = sol.t, kwargs...)
 ```
 
 `solve` is fully compatible with automatic differentiation libraries
 like:
 
+  - [Enzyme.jl](https://github.com/EnzymeAD/Enzyme.jl) (recommended for reverse-mode)
+  - [Mooncake.jl](https://github.com/chalk-lab/Mooncake.jl)
   - [Zygote.jl](https://fluxml.ai/Zygote.jl/stable/)
   - [ReverseDiff.jl](https://juliadiff.org/ReverseDiff.jl/)
   - [Tracker.jl](https://github.com/FluxML/Tracker.jl)
@@ -124,7 +127,9 @@ stabilization to ensure it works for large stiff equations, while specialization
 on static objects allows for high efficiency on small equations. For an overview
 of the topic with applications, consult the paper
 [Universal Differential Equations for Scientific Machine
-Learning](https://arxiv.org/abs/2001.04385).
+Learning](https://arxiv.org/abs/2001.04385), and for a broader review of
+differentiable programming techniques for differential equations, see
+[Sapienza et al. (2024)](https://arxiv.org/abs/2406.09699).
 
 You can efficiently use the package for:
 
@@ -163,10 +168,10 @@ Many training techniques are supported by this package, including:
   - O(1) memory backprop of ODEs via BacksolveAdjoint, and Virtual Brownian Trees for O(1) backprop of SDEs
   - [Continuous adjoints for integral loss functions](@ref continuous_loss)
   - Probabilistic programming and variational inference on ODEs/SDEs/DAEs/DDEs/hybrid
-    equations etc. is provided by integration with [Turing.jl](https://turing.ml/stable/docs/using-turing/)
+    equations etc. is provided by integration with [Turing.jl](https://turinglang.org/v0.29/docs/using-turing/get-started)
     and [Gen.jl](https://github.com/probcomp/Gen.jl). Reproduce
     [variational loss functions](https://arxiv.org/abs/2001.01328) by plugging
-    [composable libraries together](https://turing.ml/stable/tutorials/09-variational-inference/).
+    [composable libraries together](https://turinglang.org/v0.29/tutorials/09-variational-inference/).
 
 all while mixing forward mode and reverse mode approaches as appropriate for the
 most speed. For more details on the adjoint sensitivity analysis methods for
@@ -195,7 +200,7 @@ use and swap out the ODE solver between any common interface compatible library,
   - [… etc. many other choices!](https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/)
 
 In addition, due to the composability of the system, none of the components are directly
-tied to the Flux.jl machine learning framework. For example, you can [use SciMLSensitivity.jl
+tied to the Lux.jl machine learning framework. For example, you can [use SciMLSensitivity.jl
 to generate TensorFlow graphs and train the neural network with TensorFlow.jl](https://youtu.be/n2MwJ1guGVQ?t=284),
 [use PyTorch arrays via Torch.jl](https://github.com/FluxML/Torch.jl), and more all with
 single line code changes by utilizing the underlying code generation. The tutorials shown here
@@ -212,7 +217,7 @@ Julia packages.
 ## Contributing
 
   - Please refer to the
-    [SciML ColPrac: Contributor's Guide on Collaborative Practices for Community Packages](https://github.com/SciML/ColPrac/blob/master/README.md)
+    [SciML ColPrac: Contributor's Guide on Collaborative Practices for Community Packages](https://github.com/SciML/ColPrac)
     for guidance on PRs, issues, and other matters relating to contributing to SciML.
 
   - See the [SciML Style Guide](https://github.com/SciML/SciMLStyle) for common coding practices and other style decisions.
@@ -245,7 +250,7 @@ If you use SciMLSensitivity.jl or are influenced by its ideas, please cite:
 ```
 
 ```@example
-using Pkg # hide
+import Pkg # hide
 Pkg.status() # hide
 ```
 
@@ -258,8 +263,8 @@ Pkg.status() # hide
 ```
 
 ```@example
-using InteractiveUtils # hide
-versioninfo() # hide
+import InteractiveUtils
+InteractiveUtils.versioninfo() # hide
 ```
 
 ```@raw html
@@ -271,40 +276,27 @@ versioninfo() # hide
 ```
 
 ```@example
-using Pkg # hide
-Pkg.status(; mode = PKGMODE_MANIFEST) # hide
+import Pkg # hide
+Pkg.status(; mode = Pkg.PKGMODE_MANIFEST) # hide
 ```
 
 ```@raw html
 </details>
 ```
 
-```@raw html
-You can also download the 
-<a href="
-```
-
 ```@eval
-using TOML
+import TOML
+import Markdown
 version = TOML.parse(read("../../Project.toml", String))["version"]
 name = TOML.parse(read("../../Project.toml", String))["name"]
-link = "https://github.com/SciML/" * name * ".jl/tree/gh-pages/v" * version *
-       "/assets/Manifest.toml"
-```
-
-```@raw html
-">manifest</a> file and the
-<a href="
-```
-
-```@eval
-using TOML
-version = TOML.parse(read("../../Project.toml", String))["version"]
-name = TOML.parse(read("../../Project.toml", String))["name"]
-link = "https://github.com/SciML/" * name * ".jl/tree/gh-pages/v" * version *
-       "/assets/Project.toml"
-```
-
-```@raw html
-">project</a> file.
+link_manifest = "https://github.com/SciML/" * name * ".jl/tree/gh-pages/v" * version *
+                "/assets/Manifest.toml"
+link_project = "https://github.com/SciML/" * name * ".jl/tree/gh-pages/v" * version *
+               "/assets/Project.toml"
+Markdown.parse("""You can also download the
+[manifest]($link_manifest)
+file and the
+[project]($link_project)
+file.
+""")
 ```

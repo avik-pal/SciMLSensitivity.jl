@@ -13,8 +13,18 @@ optimization, while `KrylovTrustRegion` will utilize a Krylov-based method
 with Hessian-vector products (never forming the Hessian) for large parameter
 optimizations.
 
+
 ```@example secondorderadjoints
-using Flux, DiffEqFlux, Optimization, OptimizationFlux, DifferentialEquations, Plots, Random
+import SciMLSensitivity as SMS
+import Lux
+import ComponentArrays as CA
+import Optimization as OPT
+import OptimizationOptimisers as OPO
+import OrdinaryDiffEq as ODE
+import Plots
+import Random
+import OptimizationOptimJL as OOJ
+import Enzyme
 
 u0 = Float32[2.0; 0.0]
 datasize = 30
@@ -26,28 +36,34 @@ function trueODEfunc(du, u, p, t)
     du .= ((u .^ 3)'true_A)'
 end
 
-prob_trueode = ODEProblem(trueODEfunc, u0, tspan)
-ode_data = Array(solve(prob_trueode, Tsit5(), saveat = tsteps))
+prob_trueode = ODE.ODEProblem(trueODEfunc, u0, tspan)
+ode_data = Array(ODE.solve(prob_trueode, ODE.Tsit5(), saveat = tsteps))
 
-dudt2 = Flux.Chain(x -> x .^ 3,
-                   Flux.Dense(2, 50, tanh),
-                   Flux.Dense(50, 2))
-prob_neuralode = NeuralODE(dudt2, tspan, Tsit5(), saveat = tsteps)
+dudt2 = Lux.Chain(x -> x .^ 3, Lux.Dense(2, 50, tanh), Lux.Dense(50, 2))
+ps, st = Lux.setup(Random.default_rng(), dudt2)
+function neuralodefunc(u, p, t)
+    dudt2(u, p, st)[1]
+end
+function prob_neuralode(u0, p)
+    prob = ODE.ODEProblem(neuralodefunc, u0, tspan, p)
+    sol = ODE.solve(prob, ODE.Tsit5(), saveat = tsteps)
+end
+ps = CA.ComponentArray(ps)
 
 function predict_neuralode(p)
-    Array(prob_neuralode(u0, p)[1])
+    Array(prob_neuralode(u0, p))
 end
 
 function loss_neuralode(p)
     pred = predict_neuralode(p)
     loss = sum(abs2, ode_data .- pred)
-    return loss, pred
+    return loss
 end
 
 # Callback function to observe training
 list_plots = []
 iter = 0
-callback = function (p, l, pred; doplot = false)
+callback = function (state, l; doplot = false)
     global list_plots, iter
 
     if iter == 0
@@ -58,27 +74,26 @@ callback = function (p, l, pred; doplot = false)
     display(l)
 
     # plot current prediction against data
-    plt = scatter(tsteps, ode_data[1, :], label = "data")
-    scatter!(plt, tsteps, pred[1, :], label = "prediction")
+    pred = predict_neuralode(state.u)
+    plt = Plots.scatter(tsteps, ode_data[1, :], label = "data")
+    Plots.scatter!(plt, tsteps, pred[1, :], label = "prediction")
     push!(list_plots, plt)
     if doplot
-        display(plot(plt))
+        display(Plots.plot(plt))
     end
 
     return l < 0.01
 end
 
-adtype = Optimization.AutoZygote()
-optf = Optimization.OptimizationFunction((x, p) -> loss_neuralode(x), adtype)
+adtype1 = OPT.AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+optf1 = OPT.OptimizationFunction((x, p) -> loss_neuralode(x), adtype1)
+optprob1 = OPT.OptimizationProblem(optf1, ps)
+pstart = OPT.solve(optprob1, OPO.Adam(0.01); callback, maxiters = 100).u
 
-optprob1 = Optimization.OptimizationProblem(optf, prob_neuralode.p)
-pstart = Optimization.solve(optprob1, ADAM(0.01), callback = callback, maxiters = 100).u
-
-optprob2 = Optimization.OptimizationProblem(optf, pstart)
-pmin = Optimization.solve(optprob2, NewtonTrustRegion(), callback = callback,
-                          maxiters = 200)
-pmin = Optimization.solve(optprob2, Optim.KrylovTrustRegion(), callback = callback,
-                          maxiters = 200)
+adtype2 = OPT.AutoZygote()
+optf2 = OPT.OptimizationFunction((x, p) -> loss_neuralode(x), adtype2)
+optprob2 = OPT.OptimizationProblem(optf2, pstart)
+pmin = OPT.solve(optprob2, OOJ.NewtonTrustRegion(); callback, maxiters = 200)
 ```
 
 Note that we do not demonstrate `Newton()` because we have not found a single

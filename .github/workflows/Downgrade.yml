@@ -1,0 +1,29 @@
+name: Downgrade
+on:
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - 'docs/**'
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'docs/**'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  test:
+    # Runs strict (allow_reresolve=false): the [compat] lower bounds must be the
+    # real transitive floors so the minimum-version manifest resolves.
+    name: Downgrade
+    strategy:
+      matrix:
+        julia-version: ['lts']
+        group: ['Core1']
+    uses: "SciML/.github/.github/workflows/downgrade.yml@v1"
+    with:
+      julia-version: "${{ matrix.julia-version }}"
+      group: "${{ matrix.group }}"
+    secrets: "inherit"

@@ -2,5 +2,7 @@
 
 ```@docs
 ODEForwardSensitivityProblem
+ODELocalSensitivityProblem
+ODEForwardSensitivityFunction
 extract_local_sensitivities
 ```

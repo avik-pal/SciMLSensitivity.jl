@@ -3,36 +3,118 @@
 # Here is where we can add a default algorithm for computing sensitivities
 # Based on problem information!
 
-function inplace_vjp(prob, u0, p, verbose)
-    du = copy(u0)
+# Use a narrow union instead of AbstractNonlinearProblem so that composite problem
+# types like SCCNonlinearProblem (which should differentiate through their individual
+# NonlinearProblem sub-solves) don't accidentally match these dispatches.
+#
+# NOTE: SCCNonlinearProblem is intentionally excluded. Its ChainRules rrule
+# (in SCCNonlinearSolveChainRulesCoreExt) calls _concrete_solve_adjoint, but no
+# dispatch exists here for it. This means reverse-mode AD through SCCNonlinearProblem
+# currently falls through to the SciMLBase stub error. See issue #1358.
+# A dedicated _concrete_solve_adjoint for SCCNonlinearProblem would need to handle
+# the SCC block structure (sub-problem solves + explicitfuns!) rather than treating
+# it as a monolithic nonlinear system.
+const ConcreteNonlinearProblem = Union{
+    NonlinearProblem, SciMLBase.ImmutableNonlinearProblem, SciMLBase.SteadyStateProblem,
+}
+
+const have_not_warned_vjp = Ref(true)
+const STACKTRACE_WITH_VJPWARN = Ref(false)
+
+
+# Non-capturing probe for the EnzymeVJP availability check. The RHS `f` is passed as an
+# explicit argument (annotated `Duplicated`) rather than captured in a closure. Capturing it
+# makes the differentiated function object carry the RHS — and any arrays it holds, e.g. a
+# `SparseMatrixCSC` field — as closure data, which Enzyme cannot prove read-only, so the
+# probe spuriously throws `EnzymeMutabilityException` and falls back to ReverseDiff even
+# though EnzymeVJP works for such RHS. `f` is given a shadow (`Duplicated`, not `Const`) to
+# match how the state and parameter VJPs invoke Enzyme on the in-place RHS
+# (`Duplicated(SciMLBase.Void(f), …)`), so an `f` that mutates internal caches or embeds
+# parameters is probed with the same activity patterns it will use.
+function _enzyme_vjp_probe(f, repack, out, u, _p, t)
+    f(out, u, repack(_p), t)
+    return nothing
+end
+
+function _probe_enzyme_vjp(mode, f, repack, u, p, t)
+    Enzyme.autodiff(
+        mode, _enzyme_vjp_probe,
+        Enzyme.Duplicated(f, Enzyme.make_zero(f)), Enzyme.Const(repack),
+        Enzyme.Duplicated(zero(u), copy(u)),
+        Enzyme.Duplicated(copy(u), zero(u)), Enzyme.Duplicated(copy(p), zero(p)),
+        Enzyme.Const(t)
+    )
+    Enzyme.autodiff(
+        mode, _enzyme_vjp_probe,
+        Enzyme.Duplicated(f, Enzyme.make_zero(f)), Enzyme.Const(repack),
+        Enzyme.Duplicated(zero(u), copy(u)),
+        Enzyme.Const(copy(u)), Enzyme.Duplicated(copy(p), zero(p)), Enzyme.Const(t)
+    )
+    return nothing
+end
+
+function inplace_vjp(prob, u0, p, verbose, repack)
+    # The probes below call `f(du, u, p, t)` and thus cannot handle DAE
+    # residuals `f(res, du, u, p, t)`; the DAE residual vjp machinery
+    # (the SundialsAdjoint/IDA path) is ReverseDiff-tape based.
+    prob isa SciMLBase.AbstractDAEProblem && return ReverseDiffVJP()
+    # Get verbosity for sensitivity VJP choice warnings
+    _verbose = _get_sensitivity_vjp_verbose(verbose)
+    # Get time value - NonlinearProblems don't have tspan
+    t0 = prob isa AbstractNonlinearProblem ? nothing : prob.tspan[1]
 
     ez = try
         f = unwrapped_f(prob.f)
-        Enzyme.autodiff(Enzyme.Duplicated(du, du),
-                        copy(u0), copy(p), prob.tspan[1]) do out, u, _p, t
-            f(out, u, _p, t)
-            nothing
+
+        # Skip Enzyme autodiff for NonlinearProblems since they don't have tspan
+        if prob isa AbstractNonlinearProblem
+            false
+        else
+            _probe_enzyme_vjp(Enzyme.Reverse, f, repack, u0, p, t0)
+            true
         end
-        true
     catch e
-        if verbose
-            @warn "EnzymeVJP tried and failed in the automated AD choice algorithm with the following error. (To turn off this printing, add `verbose = false` to the `solve` call)\n"
-            showerror(stderr, e)
-            println()
-        end
         false
     end
     if ez
         return EnzymeVJP()
     end
 
+    # Try Enzyme with runtime activity if regular Enzyme failed
+    erz = try
+        f = unwrapped_f(prob.f)
+        # Skip Enzyme autodiff for NonlinearProblems since they don't have tspan
+        if prob isa AbstractNonlinearProblem
+            false
+        else
+            _probe_enzyme_vjp(
+                Enzyme.set_runtime_activity(Enzyme.Reverse), f, repack, u0, p, t0
+            )
+            true
+        end
+    catch e
+        if _verbose && have_not_warned_vjp[]
+            @warn "Potential performance improvement omitted. EnzymeVJP tried and failed in the automated AD choice algorithm. To show the stack trace, set SciMLSensitivity.STACKTRACE_WITH_VJPWARN[] = true. To turn off this printing, add `verbose = false` to the `solve` call.\n"
+            STACKTRACE_WITH_VJPWARN[] && showerror(stderr, e)
+            println()
+            have_not_warned_vjp[] = false
+        end
+        false
+    end
+    if erz
+        return EnzymeVJP(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    end
+
     # Determine if we can compile ReverseDiff
     compile = try
         f = unwrapped_f(prob.f)
-        if DiffEqBase.isinplace(prob)
-            !hasbranching(f, copy(u0), u0, p, prob.tspan[1])
+        # Skip hasbranching check for NonlinearProblems
+        if prob isa AbstractNonlinearProblem
+            false
+        elseif DiffEqBase.isinplace(prob)
+            !hasbranching(f, copy(u0), u0, repack(p), t0)
         else
-            !hasbranching(f, u0, p, prob.tspan[1])
+            !hasbranching(f, u0, repack(p), t0)
         end
     catch
         false
@@ -40,17 +122,29 @@ function inplace_vjp(prob, u0, p, verbose)
 
     vjp = try
         f = unwrapped_f(prob.f)
-        ReverseDiff.GradientTape((copy(u0), p, [prob.tspan[1]])) do u, p, t
-            du1 = similar(u, size(u))
-            f(du1, u, p, first(t))
-            return vec(du1)
+        tspan_ = prob isa AbstractNonlinearProblem ? nothing : [t0]
+        if p === nothing || p isa SciMLBase.NullParameters
+            ReverseDiff.GradientTape((copy(u0), tspan_)) do u, t
+                du1 = similar(u, size(u))
+                du1 .= 0
+                f(du1, u, p, first(t))
+                return vec(du1)
+            end
+        else
+            ReverseDiff.GradientTape((copy(u0), p, tspan_)) do u, p, t
+                du1 = similar(u, size(u))
+                du1 .= 0
+                f(du1, u, repack(p), first(t))
+                return vec(du1)
+            end
         end
         ReverseDiffVJP(compile)
     catch e
-        if verbose
-            @warn "ReverseDiffVJP tried and failed in the automated AD choice algorithm with the following error. (To turn off this printing, add `verbose = false` to the `solve` call)\n"
-            showerror(stderr, e)
+        if _verbose
+            @warn "Potential performance improvement omitted. ReverseDiffVJP tried and failed in the automated AD choice algorithm. To show the stack trace, set SciMLSensitivity.STACKTRACE_WITH_VJPWARN[] = true. To turn off this printing, add `verbose = false` to the `solve` call.\n"
+            STACKTRACE_WITH_VJPWARN[] && showerror(stderr, e)
             println()
+            have_not_warned_vjp[] = false
         end
         false
     end
@@ -58,27 +152,137 @@ function inplace_vjp(prob, u0, p, verbose)
     return vjp
 end
 
-function automatic_sensealg_choice(prob::Union{SciMLBase.AbstractODEProblem,
-                                               SciMLBase.AbstractSDEProblem}, u0, p,
-                                   verbose)
-    default_sensealg = if p !== DiffEqBase.NullParameters() &&
-                          !(eltype(u0) <: ForwardDiff.Dual) &&
-                          !(eltype(p) <: ForwardDiff.Dual) &&
-                          !(eltype(u0) <: Complex) &&
-                          !(eltype(p) <: Complex) &&
-                          length(u0) + length(p) <= 100
+# SciMLBase.sensitivity_solution has no DAESolution method; mirror its
+# ODESolution body here until that method exists upstream. Note the `du` and `k`
+# fields of the trimmed solution are left untouched, like `k` in the ODE version.
+function _sensitivity_solution(sol::SciMLBase.AbstractDAESolution, u, t)
+    interp = SciMLBase.enable_interpolation_sensitivitymode(sol.interp)
+    @reset sol.u = u
+    @reset sol.t = t isa Vector ? t : collect(t)
+    @reset sol.interp = interp
+    return sol
+end
+_sensitivity_solution(sol, u, t) = SciMLBase.sensitivity_solution(sol, u, t)
+
+# The DAE residual signature f(res, du, u, p, t) needs its own probe; only the
+# ReverseDiff tape and numerical fallbacks are supported by the DAE adjoint.
+function inplace_vjp(prob::SciMLBase.AbstractDAEProblem, u0, p, verbose, repack)
+    _verbose = _get_sensitivity_vjp_verbose(verbose)
+    du0 = prob.du0
+    t0 = prob.tspan[1]
+
+    compile = try
+        f = unwrapped_f(prob.f)
+        !hasbranching(f, copy(u0), copy(du0), u0, repack(p), t0)
+    catch
+        false
+    end
+
+    vjp = try
+        f = unwrapped_f(prob.f)
+        if p === nothing || p isa SciMLBase.NullParameters
+            ReverseDiff.GradientTape((copy(du0), copy(u0), [t0])) do du, u, t
+                res = similar(u, size(u))
+                res .= 0
+                f(res, du, u, p, first(t))
+                return vec(res)
+            end
+        else
+            ReverseDiff.GradientTape((copy(du0), copy(u0), p, [t0])) do du, u, p, t
+                res = similar(u, size(u))
+                res .= 0
+                f(res, du, u, repack(p), first(t))
+                return vec(res)
+            end
+        end
+        ReverseDiffVJP(compile)
+    catch e
+        if _verbose
+            @warn "Potential performance improvement omitted. ReverseDiffVJP tried and failed in the automated AD choice algorithm. To show the stack trace, set SciMLSensitivity.STACKTRACE_WITH_VJPWARN[] = true. To turn off this printing, add `verbose = false` to the `solve` call.\n"
+            STACKTRACE_WITH_VJPWARN[] && showerror(stderr, e)
+            println()
+            have_not_warned_vjp[] = false
+        end
+        false
+    end
+
+    return vjp
+end
+
+function automatic_sensealg_choice(
+        prob::Union{
+            SciMLBase.AbstractODEProblem,
+            SciMLBase.AbstractSDEProblem,
+        },
+        u0, p, verbose, repack, original_p = p
+    )
+    # Get verbosity for sensitivity VJP choice warnings
+    _verbose = _get_sensitivity_vjp_verbose(verbose)
+
+    if p === nothing || p isa SciMLBase.NullParameters
+        tunables, repack = p, identity
+    elseif repack !== nothing
+        # The caller has already canonicalized: `p` is the tunables and `repack`
+        # reconstructs the original parameter object. Canonicalizing again would
+        # replace the caller's repack with an identity-like one (e.g.
+        # `SciMLStructures.ArrayRepack` for `MTKParameters`), making every VJP
+        # probe call the RHS with the bare tunables vector instead of the
+        # parameter object it will actually receive. See #1605.
+        tunables = p
+    elseif isscimlstructure(p)
+        tunables, repack, _ = canonicalize(Tunable(), p)
+    elseif isfunctor(p)
+        tunables, repack = Functors.functor(p)
+    else
+        throw(SciMLStructuresCompatibilityError())
+    end
+
+    # For functor params, always choose GaussAdjoint with ZygoteVJP.
+    # ZygoteVJP is the only VJP that natively supports structured parameter types.
+    if isfunctor(p) && !(p isa AbstractArray) && !isscimlstructure(p)
+        return GaussAdjoint(autojacvec = ZygoteVJP())
+    end
+
+    # Check if the original parameter has non-tunable active components
+    # (e.g. caches from SCCNonlinearProblem explicitfuns!).
+    _has_caches = isscimlstructure(original_p) && !(original_p isa AbstractArray) &&
+        hasfield(typeof(original_p), :caches) && !isempty(original_p.caches)
+    _diff_tunables = _has_caches ? Val(false) : Val(true)
+
+    default_sensealg = if p !== SciMLBase.NullParameters() &&
+            !(eltype(u0) <: ForwardDiff.Dual) &&
+            !(eltype(p) <: ForwardDiff.Dual) &&
+            !(eltype(u0) <: Complex) &&
+            !(eltype(p) <: Complex) &&
+            length(u0) + length(tunables) <= 100
         ForwardDiffSensitivity()
     elseif u0 isa GPUArraysCore.AbstractGPUArray || !DiffEqBase.isinplace(prob)
         # only Zygote is GPU compatible and fast
         # so if out-of-place, try Zygote
 
         vjp = try
-            Zygote.gradient((u, p) -> sum(prob.f(u, p, prob.tspan[1])), u0, p)
+            p = prob.p
+            y = prob.u0
+            f = prob.f
+            t = prob.tspan[1]
+            λ = zero(prob.u0)
+
+            if p === nothing || p isa SciMLBase.NullParameters
+                _dy, back = Zygote.pullback(y) do u
+                    vec(f(u, p, t))
+                end
+                tmp1 = back(λ)
+            else
+                _dy, back = Zygote.pullback(y, p) do u, p
+                    vec(f(u, p, t))
+                end
+                tmp1, tmp2 = back(λ)
+            end
             ZygoteVJP()
         catch e
-            if verbose
-                @warn "ZygoteVJP tried and failed in the automated AD choice algorithm with the following error. (To turn off this printing, add `verbose = false` to the `solve` call)\n"
-                showerror(stderr, e)
+            if _verbose
+                @warn "Potential performance improvement omitted. ZygoteVJP tried and failed in the automated AD choice algorithm. To show the stack trace, set SciMLSensitivity.STACKTRACE_WITH_VJPWARN[] = true. To turn off this printing, add `verbose = false` to the `solve` call.\n"
+                STACKTRACE_WITH_VJPWARN[] && showerror(stderr, e)
                 println()
             end
             false
@@ -86,12 +290,18 @@ function automatic_sensealg_choice(prob::Union{SciMLBase.AbstractODEProblem,
 
         if vjp == false
             vjp = try
-                ReverseDiff.gradient((u, p) -> sum(prob.f(u, p, prob.tspan[1])), u0, p)
+                if p === nothing || p isa SciMLBase.NullParameters
+                    ReverseDiff.gradient((u) -> sum(prob.f(u, p, prob.tspan[1])), u0)
+                else
+                    ReverseDiff.gradient(
+                        (u, _p) -> sum(prob.f(u, repack(_p), prob.tspan[1])), u0, tunables
+                    )
+                end
                 ReverseDiffVJP()
             catch e
-                if verbose
-                    @warn "ReverseDiffVJP tried and failed in the automated AD choice algorithm with the following error. (To turn off this printing, add `verbose = false` to the `solve` call)\n"
-                    showerror(stderr, e)
+                if _verbose
+                    @warn "Potential performance improvement omitted. ReverseDiffVJP tried and failed in the automated AD choice algorithm. To show the stack trace, set SciMLSensitivity.STACKTRACE_WITH_VJPWARN[] = true. To turn off this printing, add `verbose = false` to the `solve` call.\n"
+                    STACKTRACE_WITH_VJPWARN[] && showerror(stderr, e)
                     println()
                 end
                 false
@@ -100,12 +310,28 @@ function automatic_sensealg_choice(prob::Union{SciMLBase.AbstractODEProblem,
 
         if vjp == false
             vjp = try
-                Tracker.gradient((u, p) -> sum(prob.f(u, p, prob.tspan[1])), u0, p)
+                p = prob.p
+                y = prob.u0
+                f = prob.f
+                t = prob.tspan[1]
+                λ = zero(prob.u0)
+
+                if p === nothing || p isa SciMLBase.NullParameters
+                    _dy, back = Tracker.forward(y) do u
+                        vec(f(u, p, t))
+                    end
+                    tmp1 = back(λ)
+                else
+                    _dy, back = Tracker.forward(y, tunables) do u, tunables
+                        vec(f(u, repack(tunables), t))
+                    end
+                    tmp1, tmp2 = back(λ)
+                end
                 TrackerVJP()
             catch e
-                if verbose
-                    @warn "TrackerVJP tried and failed in the automated AD choice algorithm with the following error. (To turn off this printing, add `verbose = false` to the `solve` call)\n"
-                    showerror(stderr, e)
+                if _verbose
+                    @warn "Potential performance improvement omitted. TrackerVJP tried and failed in the automated AD choice algorithm. To show the stack trace, set SciMLSensitivity.STACKTRACE_WITH_VJPWARN[] = true. To turn off this printing, add `verbose = false` to the `solve` call.\n"
+                    STACKTRACE_WITH_VJPWARN[] && showerror(stderr, e)
                     println()
                 end
                 false
@@ -113,41 +339,52 @@ function automatic_sensealg_choice(prob::Union{SciMLBase.AbstractODEProblem,
         end
 
         if vjp isa Bool
-            if verbose
+            if _verbose
                 @warn "Reverse-Mode AD VJP choices all failed. Falling back to numerical VJPs"
             end
 
-            if p === nothing || p === DiffEqBase.NullParameters()
+            if p === nothing || p === SciMLBase.NullParameters()
                 # QuadratureAdjoint skips all p calculations until the end
                 # So it's the fastest when there are no parameters
-                QuadratureAdjoint(autodiff = false, autojacvec = vjp)
+                QuadratureAdjoint(autodiff = false, autojacvec = vjp, diff_tunables = _diff_tunables)
+            elseif prob isa ODEProblem && !(vjp isa TrackerVJP)
+                GaussAdjoint(autodiff = false, autojacvec = vjp, diff_tunables = _diff_tunables)
             else
                 InterpolatingAdjoint(autodiff = false, autojacvec = vjp)
             end
         else
-            if p === nothing || p === DiffEqBase.NullParameters()
+            if p === nothing || p === SciMLBase.NullParameters()
                 # QuadratureAdjoint skips all p calculations until the end
                 # So it's the fastest when there are no parameters
-                QuadratureAdjoint(autojacvec = vjp)
+                QuadratureAdjoint(autojacvec = vjp, diff_tunables = _diff_tunables)
+            elseif prob isa ODEProblem && !(vjp isa TrackerVJP)
+                GaussAdjoint(autojacvec = vjp, diff_tunables = _diff_tunables)
             else
                 InterpolatingAdjoint(autojacvec = vjp)
             end
         end
     else
-        vjp = inplace_vjp(prob, u0, p, verbose)
+        vjp = inplace_vjp(prob, u0, tunables, verbose, repack)
+        if _diff_tunables isa Val{false} && !supports_structured_vjp(vjp)
+            vjp = ZygoteVJP()
+        end
         if vjp isa Bool
-            if verbose
+            if _verbose
                 @warn "Reverse-Mode AD VJP choices all failed. Falling back to numerical VJPs"
             end
             # If reverse-mode isn't working, just fallback to numerical vjps
-            if p === nothing || p === DiffEqBase.NullParameters()
-                QuadratureAdjoint(autodiff = false, autojacvec = vjp)
+            if p === nothing || p === SciMLBase.NullParameters()
+                QuadratureAdjoint(autodiff = false, autojacvec = vjp, diff_tunables = _diff_tunables)
+            elseif prob isa ODEProblem && !(vjp isa TrackerVJP)
+                GaussAdjoint(autodiff = false, autojacvec = vjp, diff_tunables = _diff_tunables)
             else
                 InterpolatingAdjoint(autodiff = false, autojacvec = vjp)
             end
         else
-            if p === nothing || p === DiffEqBase.NullParameters()
-                QuadratureAdjoint(autojacvec = vjp)
+            if p === nothing || p === SciMLBase.NullParameters()
+                QuadratureAdjoint(autojacvec = vjp, diff_tunables = _diff_tunables)
+            elseif prob isa ODEProblem && !(vjp isa TrackerVJP)
+                GaussAdjoint(autojacvec = vjp, diff_tunables = _diff_tunables)
             else
                 InterpolatingAdjoint(autojacvec = vjp)
             end
@@ -156,74 +393,177 @@ function automatic_sensealg_choice(prob::Union{SciMLBase.AbstractODEProblem,
     return default_sensealg
 end
 
-function automatic_sensealg_choice(prob::Union{NonlinearProblem, SteadyStateProblem}, u0, p,
-                                   verbose)
+function automatic_sensealg_choice(
+        prob::ConcreteNonlinearProblem, u0, tunables,
+        verbose, repack, original_p = tunables
+    )
+    # Check if the original parameter has non-tunable active components
+    # (e.g. caches from SCCNonlinearProblem explicitfuns!).
+    _has_caches = isscimlstructure(original_p) && !(original_p isa AbstractArray) &&
+        hasfield(typeof(original_p), :caches) && !isempty(original_p.caches)
+    _diff_tunables = _has_caches ? Val(false) : Val(true)
+
     default_sensealg = if u0 isa GPUArraysCore.AbstractGPUArray ||
-                          !DiffEqBase.isinplace(prob)
-        # autodiff = false because forwarddiff fails on many GPU kernels
-        # this only effects the Jacobian calculation and is same computation order
-        SteadyStateAdjoint(autodiff = false, autojacvec = ZygoteVJP())
+            !DiffEqBase.isinplace(prob)
+        SteadyStateAdjoint(
+            autodiff = false, autojacvec = ZygoteVJP(),
+            diff_tunables = _diff_tunables,
+        )
     else
-        vjp = inplace_vjp(prob, u0, p, verbose)
-        SteadyStateAdjoint(autojacvec = vjp)
+        vjp = inplace_vjp(prob, u0, tunables, verbose, repack)
+        if _diff_tunables isa Val{false} && !supports_structured_vjp(vjp)
+            vjp = ZygoteVJP()
+        end
+        SteadyStateAdjoint(autojacvec = vjp, diff_tunables = _diff_tunables)
     end
     return default_sensealg
 end
 
-function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEProblem,
-                                                        SciMLBase.AbstractSDEProblem,
-                                                        SciMLBase.AbstractRODEProblem},
-                                            alg, sensealg::Nothing, u0, p,
-                                            originator::SciMLBase.ADOriginator, args...;
-                                            verbose = true, kwargs...)
-    if haskey(kwargs, :callback)
-        has_cb = kwargs[:callback] !== nothing
-    else
-        has_cb = false
+"""
+    _init_originator_gradient(originator, f, tunables)
+
+Compute `∂(f(tunables))/∂tunables` for a *scalar-valued* `f`, dispatched on
+the AD originator that triggered the surrounding `_concrete_solve_adjoint`
+rrule.
+
+Used by the DAE/ODE initialization adjoint path to differentiate
+`get_initial_values` w.r.t. the tunable parameters. The default
+implementation uses Zygote (which composes with all remaining
+ChainRules-aware originators: `ChainRulesOriginator`, `ReverseDiffOriginator`,
+`TrackerOriginator`). The `EnzymeOriginator` and `MooncakeOriginator`
+methods use the corresponding native AD so the rrule does not pull in
+Zygote when those backends are driving differentiation. The Mooncake
+method lives in `ext/SciMLSensitivityMooncakeExt.jl`.
+"""
+function _init_originator_gradient(::SciMLBase.ADOriginator, f, tunables)
+    iy, back = Zygote.pullback(f, tunables)
+    return back(one(iy))[1]
+end
+
+# Init-path gradient for the `EnzymeOriginator` (outer-Enzyme) case, using a
+# nested `Enzyme.gradient` so the rrule does not pull Zygote into the Enzyme path.
+#
+# `set_runtime_activity` is required: `f` differentiates an MTK DAE
+# initialization whose `remake(_prob, p = repack(t))` builds an `ODEProblem`
+# mixing constant memory (the captured problem's `u0`/`f`/`tspan`/caches) with
+# the active parameters, which Enzyme's static activity analysis rejects.
+#
+# History of this dispatch: the nested `Enzyme.gradient` originally corrupted
+# state across repeated outer `Enzyme.autodiff` calls (#1469, upstream
+# EnzymeAD/Enzyme.jl#3139, fixed in Enzyme 0.13.163; #1467 routed it through
+# Zygote meanwhile, #1498 restored it). It was then reverted again (#1515)
+# because reverse-differentiating MTK's `__apply_copy_template` crashed with an
+# undersized shadow `Memory` `BoundsError` / TypeAnalysis blowup on the Core8
+# `DefaultInit` setup (#1514, upstream EnzymeAD/Enzyme.jl#3259, fixed via
+# EnzymeAD/Enzyme.jl#3279 in Enzyme 0.13.174 — the `[compat]` floor). A residual
+# of the same issue survived as an `EnzymeNoTypeError`: the ~552-byte
+# `NonlinearSolution` captured by value in the `mapreduce(Fix1(...))` closure
+# exceeds Enzyme's 512-byte `MaxTypeOffset`, so `__init__` raises it
+# (EnzymeAD/Enzyme.jl#3576). See #1514, #1469, #1467, #1415.
+function _init_originator_gradient(::SciMLBase.EnzymeOriginator, f, tunables)
+    return Enzyme.gradient(
+        Enzyme.set_runtime_activity(Enzyme.Reverse), Enzyme.Const(f), tunables,
+    )[1]
+end
+
+function SciMLBase._concrete_solve_adjoint(
+        prob::Union{
+            SciMLBase.AbstractODEProblem,
+            SciMLBase.AbstractSDEProblem,
+            SciMLBase.AbstractRODEProblem,
+        },
+        alg, sensealg::Nothing, u0, p,
+        originator::SciMLBase.ADOriginator, args...;
+        verbose = SciMLLogging.Standard(), kwargs...
+    )
+    has_cb = _has_effective_callback(get(kwargs, :callback, nothing))
+
+    if !(p === nothing || p isa SciMLBase.NullParameters)
+        if !isscimlstructure(p) && !isfunctor(p)
+            throw(SciMLStructuresCompatibilityError())
+        end
     end
-    default_sensealg = automatic_sensealg_choice(prob, u0, p, verbose)
-    if has_cb && typeof(default_sensealg) <: AbstractAdjointSensitivityAlgorithm
+
+    if p === nothing || p isa SciMLBase.NullParameters
+        tunables, repack = p, identity
+    elseif isscimlstructure(p)
+        tunables, repack, aliases = canonicalize(Tunable(), p)
+    elseif isfunctor(p)
+        tunables, repack = Functors.functor(p)
+    else
+        throw(SciMLStructuresCompatibilityError())
+    end
+
+    default_sensealg = automatic_sensealg_choice(prob, u0, tunables, verbose, repack, p)
+    if has_cb && default_sensealg isa AbstractAdjointSensitivityAlgorithm &&
+            !(typeof(default_sensealg.autojacvec) <: Union{EnzymeVJP, ReverseDiffVJP, ReactantVJP})
         default_sensealg = setvjp(default_sensealg, ReverseDiffVJP())
     end
-    DiffEqBase._concrete_solve_adjoint(prob, alg, default_sensealg, u0, p,
-                                       originator::SciMLBase.ADOriginator, args...; verbose,
-                                       kwargs...)
+    return SciMLBase._concrete_solve_adjoint(
+        prob, alg, default_sensealg, u0, p,
+        originator, args...; verbose,
+        kwargs...
+    )
 end
 
-function DiffEqBase._concrete_solve_adjoint(prob::Union{NonlinearProblem, SteadyStateProblem
-                                                        }, alg,
-                                            sensealg::Nothing, u0, p,
-                                            originator::SciMLBase.ADOriginator, args...;
-                                            verbose = true, kwargs...)
-    default_sensealg = automatic_sensealg_choice(prob, u0, p, verbose)
-    DiffEqBase._concrete_solve_adjoint(prob, alg, default_sensealg, u0, p,
-                                       originator::SciMLBase.ADOriginator, args...; verbose,
-                                       kwargs...)
+function SciMLBase._concrete_solve_adjoint(
+        prob::ConcreteNonlinearProblem, alg,
+        sensealg::Nothing, u0, p,
+        originator::SciMLBase.ADOriginator, args...;
+        verbose = SciMLLogging.Standard(), kwargs...
+    )
+    if !(p === nothing || p isa SciMLBase.NullParameters)
+        if !isscimlstructure(p) && !isfunctor(p)
+            throw(SciMLStructuresCompatibilityError())
+        end
+    end
+
+    if p === nothing || p isa SciMLBase.NullParameters
+        tunables, repack = p, identity
+    elseif isscimlstructure(p)
+        tunables, repack, aliases = canonicalize(Tunable(), p)
+    else
+        tunables, repack = Functors.functor(p)
+    end
+
+    u0 = state_values(prob) === nothing ? Float64[] : u0
+    default_sensealg = automatic_sensealg_choice(prob, u0, tunables, verbose, repack, p)
+    return SciMLBase._concrete_solve_adjoint(
+        prob, alg, default_sensealg, u0, p,
+        originator::SciMLBase.ADOriginator, args...; verbose,
+        kwargs...
+    )
 end
 
-function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscreteProblem,
-                                                        SciMLBase.AbstractDDEProblem,
-                                                        SciMLBase.AbstractSDDEProblem,
-                                                        SciMLBase.AbstractDAEProblem},
-                                            alg, sensealg::Nothing,
-                                            u0, p, originator::SciMLBase.ADOriginator,
-                                            args...; kwargs...)
+function SciMLBase._concrete_solve_adjoint(
+        prob::Union{
+            SciMLBase.AbstractDiscreteProblem,
+            SciMLBase.AbstractDDEProblem,
+            SciMLBase.AbstractSDDEProblem,
+            SciMLBase.AbstractDAEProblem,
+        },
+        alg, sensealg::Nothing,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; kwargs...
+    )
     if length(u0) + length(p) > 100
         default_sensealg = ReverseDiffAdjoint()
     else
         default_sensealg = ForwardDiffSensitivity()
     end
-    DiffEqBase._concrete_solve_adjoint(prob, alg, default_sensealg, u0, p,
-                                       originator::SciMLBase.ADOriginator, args...;
-                                       kwargs...)
+    return SciMLBase._concrete_solve_adjoint(
+        prob, alg, default_sensealg, u0, p,
+        originator::SciMLBase.ADOriginator, args...;
+        kwargs...
+    )
 end
 
 const ADJOINT_STEADY_PROBLEM_ERROR_MESSAGE = """
-                                             Chosen adjoint method is not compatible with the chosen problem. NonlinearProblem
-                                             and SteadyStateProblem require specific adjoint choices (like SteadyStateAdjoint)
-                                             and will not work with adjoints designed for time series models. For more details,
-                                             see https://docs.sciml.ai/SciMLSensitivity/stable/.
-                                             """
+Chosen adjoint method is not compatible with the chosen problem. NonlinearProblem
+and SteadyStateProblem require specific adjoint choices (like SteadyStateAdjoint)
+and will not work with adjoints designed for time series models. For more details,
+see https://docs.sciml.ai/SciMLSensitivity/stable/.
+"""
 
 struct AdjointSteadyProblemPairingError <: Exception
     prob::Any
@@ -235,85 +575,224 @@ function Base.showerror(io::IO, e::AdjointSteadyProblemPairingError)
     print(io, "Problem type: ")
     println(io, e.prob)
     print(io, "Sensitivity algorithm type: ")
-    println(io, e.sensealg)
+    return println(io, e.sensealg)
 end
 
 # Also include AbstractForwardSensitivityAlgorithm until a dispatch is made!
-function DiffEqBase._concrete_solve_adjoint(prob::Union{NonlinearProblem, SteadyStateProblem
-                                                        }, alg,
-                                            sensealg::Union{
-                                                            AbstractAdjointSensitivityAlgorithm,
-                                                            AbstractForwardSensitivityAlgorithm,
-                                                            TrackerAdjoint,
-                                                            ReverseDiffAdjoint,
-                                                            AbstractShadowingSensitivityAlgorithm
-                                                            },
-                                            u0, p, originator::SciMLBase.ADOriginator,
-                                            args...; kwargs...)
+function SciMLBase._concrete_solve_adjoint(
+        prob::ConcreteNonlinearProblem, alg,
+        sensealg::Union{
+            AbstractAdjointSensitivityAlgorithm,
+            AbstractForwardSensitivityAlgorithm,
+            TrackerAdjoint,
+            ReverseDiffAdjoint,
+            AbstractShadowingSensitivityAlgorithm,
+        },
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; kwargs...
+    )
     throw(AdjointSteadyProblemPairingError(prob, sensealg))
 end
 
-function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEProblem,
-                                                        SciMLBase.AbstractSDEProblem,
-                                                        SciMLBase.AbstractRODEProblem}, alg,
-                                            sensealg::Union{BacksolveAdjoint,
-                                                            QuadratureAdjoint,
-                                                            InterpolatingAdjoint},
-                                            u0, p, originator::SciMLBase.ADOriginator,
-                                            args...; save_start = true, save_end = true,
-                                            saveat = eltype(prob.tspan)[],
-                                            save_idxs = nothing,
-                                            kwargs...)
-    if !(typeof(p) <: Union{Nothing, SciMLBase.NullParameters, AbstractArray}) ||
-       (p isa AbstractArray && !Base.isconcretetype(eltype(p)))
+function SciMLBase._concrete_solve_adjoint(
+        prob::Union{
+            SciMLBase.AbstractODEProblem,
+            SciMLBase.AbstractDAEProblem,
+            SciMLBase.AbstractSDEProblem,
+            SciMLBase.AbstractRODEProblem,
+            SciMLBase.AbstractDAEProblem,
+        },
+        alg,
+        sensealg::Union{
+            BacksolveAdjoint,
+            QuadratureAdjoint,
+            InterpolatingAdjoint,
+            GaussAdjoint,
+            GaussKronrodAdjoint,
+            SundialsAdjoint,
+        },
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; save_start = true, save_end = true,
+        saveat = eltype(prob.tspan)[],
+        save_idxs = nothing,
+        initializealg_default = SciMLBase.OverrideInit(; abstol = 1.0e-6, reltol = 1.0e-3),
+        kwargs...
+    )
+    if !supports_functor_params(sensealg) &&
+            !(p isa Union{Nothing, SciMLBase.NullParameters, AbstractArray}) &&
+            !isscimlstructure(p) ||
+            (p isa AbstractArray && !Base.isconcretetype(eltype(p)))
         throw(AdjointSensitivityParameterCompatibilityError())
     end
 
+    # Check VJP compatibility for functor params
+    if supports_functor_params(sensealg) && isfunctor(p) &&
+            !supports_structured_vjp(sensealg.autojacvec)
+        error(
+            "$(typeof(sensealg.autojacvec)) does not support Functors.jl parameter structs. " *
+                "Use ZygoteVJP() instead, e.g., $(nameof(typeof(sensealg)))(autojacvec=ZygoteVJP())" *
+                "or make `p` a SciMLStructure. See SciMLStructures.jl."
+        )
+    end
+
+    if p === nothing || p isa SciMLBase.NullParameters
+        tunables, repack = p, identity
+    elseif isscimlstructure(p)
+        tunables, repack, aliases = canonicalize(Tunable(), p)
+    elseif supports_functor_params(sensealg) && isfunctor(p)
+        tunables, repack = Functors.functor(p)
+    else
+        throw(SciMLStructuresCompatibilityError())
+    end
     # Remove saveat, etc. from kwargs since it's handled separately
     # and letting it jump back in there can break the adjoint
-    kwargs_prob = NamedTuple(filter(x -> x[1] != :saveat && x[1] != :save_start &&
-                                             x[1] != :save_end && x[1] != :save_idxs,
-                                    prob.kwargs))
+    kwargs_prob = NamedTuple(
+        filter(
+            x -> x[1] != :saveat && x[1] != :save_start &&
+                x[1] != :save_end && x[1] != :save_idxs &&
+                (x[1] != :callback || _has_effective_callback(x[2])),
+            prob.kwargs
+        )
+    )
 
     if haskey(kwargs, :callback)
-        cb = track_callbacks(CallbackSet(kwargs[:callback]), prob.tspan[1], prob.u0, prob.p,
-                             sensealg)
-        _prob = remake(prob; u0 = u0, p = p, kwargs = merge(kwargs_prob, (; callback = cb)))
+        cb = track_callbacks(
+            CallbackSet(kwargs[:callback]), current_time(prob),
+            state_values(prob), parameter_values(prob),
+            sensealg
+        )
+        _prob = remake(prob; u0, p, kwargs = merge(kwargs_prob, (; callback = cb)))
     else
         cb = nothing
-        _prob = remake(prob; u0 = u0, p = p, kwargs = kwargs_prob)
+        _prob = remake(prob; u0, p, kwargs = kwargs_prob)
     end
 
     # Remove callbacks, saveat, etc. from kwargs since it's handled separately
-    kwargs_fwd = NamedTuple{Base.diff_names(Base._nt_names(values(kwargs)), (:callback,))}(values(kwargs))
+    kwargs_fwd = NamedTuple{
+        Base.diff_names(
+            Base._nt_names(values(kwargs)), (
+                :callback, :initializealg,
+            )
+        ),
+    }(values(kwargs))
 
     # Capture the callback_adj for the reverse pass and remove both callbacks
     kwargs_adj = NamedTuple{
-                            Base.diff_names(Base._nt_names(values(kwargs)),
-                                            (:callback_adj, :callback))}(values(kwargs))
+        Base.diff_names(
+            Base._nt_names(values(kwargs)),
+            (:callback_adj, :callback)
+        ),
+    }(values(kwargs))
     isq = sensealg isa QuadratureAdjoint
-    if typeof(sensealg) <: BacksolveAdjoint
-        sol = solve(_prob, alg, args...; save_noise = true,
-                    save_start = save_start, save_end = save_end,
-                    saveat = saveat, kwargs_fwd...)
-    elseif ischeckpointing(sensealg)
-        sol = solve(_prob, alg, args...; save_noise = true,
-                    save_start = true, save_end = true,
-                    saveat = saveat, kwargs_fwd...)
+    kwargs_init = kwargs_adj[Base.diff_names(Base._nt_names(kwargs_adj), (:initializealg,))]
+
+    if haskey(kwargs, :initializealg) || haskey(prob.kwargs, :initializealg)
+        initializealg = haskey(kwargs, :initializealg) ? kwargs[:initializealg] :
+            prob.kwargs[:initializealg]
     else
-        sol = solve(_prob, alg, args...; save_noise = true, save_start = true,
-                    save_end = true, kwargs_fwd...)
+        initializealg = DefaultInit()
+    end
+
+    default_inits = Union{OverrideInit, Nothing, DefaultInit}
+    igs, new_u0,
+        new_p,
+        new_initializealg = if (
+            SciMLBase.has_initialization_data(_prob.f) &&
+                initializealg isa default_inits
+        )
+        initializeprob = prob.f.initialization_data.initializeprob
+        iu0 = state_values(initializeprob)
+        isAD = if iu0 === nothing
+            AutoForwardDiff
+        elseif has_autodiff(alg)
+            OrdinaryDiffEqCore.alg_autodiff(alg) isa AutoForwardDiff
+        else
+            true
+        end
+        nlsolve_alg = default_nlsolve(
+            nothing, Val(isinplace(_prob)), iu0, initializeprob, isAD
+        )
+        initializealg = initializealg isa Union{Nothing, DefaultInit} ?
+            initializealg_default : initializealg
+
+        # Forward: actually compute the initial values once outside any AD
+        # call. This avoids depending on side-effect capture of `new_u0` /
+        # `new_p` from inside an AD-traced closure, which is unsafe for
+        # backends like Mooncake/Enzyme that build a separate trace.
+        new_u0, new_p,
+            _ = SciMLBase.get_initial_values(
+            _prob, _prob, _prob.f, initializealg, Val(isinplace(_prob));
+            sensealg = SteadyStateAdjoint(autojacvec = sensealg.autojacvec),
+            nlsolve_alg,
+            kwargs_init...
+        )
+
+        # Reverse: gradient of `sum(new_u0)` w.r.t. tunables, treating the
+        # initialization map `tunables -> new_u0` as a function. The
+        # OVERDETERMINED case has no contribution. The non-OVERDETERMINED
+        # case dispatches to the AD backend that triggered this rrule via
+        # `_init_originator_gradient`, so Mooncake-driven AD does not pull
+        # in Zygote at this point.
+        igs = if SciMLBase.initialization_status(_prob) == SciMLBase.OVERDETERMINED
+            zero(tunables)
+        else
+            init_loss = let _prob = _prob, repack = repack,
+                    initializealg = initializealg, nlsolve_alg = nlsolve_alg,
+                    sensealg = sensealg, kwargs_init = kwargs_init
+                function (t)
+                    new_prob_t = remake(_prob, p = repack(t), lazy_initialization = true)
+                    nu0, _,
+                        _ = SciMLBase.get_initial_values(
+                        new_prob_t, new_prob_t, new_prob_t.f, initializealg,
+                        Val(isinplace(new_prob_t));
+                        sensealg = SteadyStateAdjoint(
+                            autojacvec = sensealg.autojacvec,
+                        ),
+                        nlsolve_alg,
+                        kwargs_init...,
+                    )
+                    return sum(nu0)
+                end
+            end
+            _init_originator_gradient(originator, init_loss, tunables)
+        end
+
+        igs, new_u0, new_p, SciMLBase.CheckInit()
+    else
+        nothing, u0, p, initializealg
+    end
+
+    _prob = remake(_prob, u0 = new_u0, p = new_p)
+
+    if sensealg isa BacksolveAdjoint
+        sol = solve(
+            _prob, alg, args...; initializealg = new_initializealg, save_noise = true,
+            save_start, save_end,
+            saveat, wrap = Val(false), kwargs_fwd...
+        )
+    elseif ischeckpointing(sensealg)
+        sol = solve(
+            _prob, alg, args...; initializealg = new_initializealg, save_noise = true,
+            save_start = true, save_end = true,
+            saveat, wrap = Val(false), kwargs_fwd...
+        )
+    else
+        sol = solve(
+            _prob, alg, args...; initializealg = new_initializealg,
+            save_noise = true, save_start = true,
+            save_end = true, wrap = Val(false), kwargs_fwd...
+        )
     end
 
     # Force `save_start` and `save_end` in the forward pass This forces the
     # solver to do the backsolve all the way back to `u0` Since the start aliases
     # `_prob.u0`, this doesn't actually use more memory But it cleans up the
     # implementation and makes `save_start` and `save_end` arg safe.
-    if typeof(sensealg) <: BacksolveAdjoint
+    if sensealg isa BacksolveAdjoint
         # Saving behavior unchanged
-        ts = sol.t
+        ts = current_time(sol)
         only_end = length(ts) == 1 && ts[1] == _prob.tspan[2]
-        out = DiffEqBase.sensitivity_solution(sol, sol.u, ts)
+        out = _sensitivity_solution(sol, state_values(sol), ts)
     elseif saveat isa Number
         if _prob.tspan[2] > _prob.tspan[1]
             ts = _prob.tspan[1]:convert(typeof(_prob.tspan[2]), abs(saveat)):_prob.tspan[2]
@@ -321,171 +800,245 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
             ts = _prob.tspan[2]:convert(typeof(_prob.tspan[2]), abs(saveat)):_prob.tspan[1]
         end
         # if _prob.tspan[2]-_prob.tspan[1] is not a multiple of saveat, one looses the last ts value
-        sol.t[end] !== ts[end] && (ts = fix_endpoints(sensealg, sol, ts))
+        last(current_time(sol)) !== ts[end] && (ts = fix_endpoints(sensealg, sol, ts))
         if cb === nothing
             _out = sol(ts)
         else
-            _, duplicate_iterator_times = separate_nonunique(sol.t)
+            _, duplicate_iterator_times = separate_nonunique(current_time(sol))
             _out, ts = out_and_ts(ts, duplicate_iterator_times, sol)
         end
 
         out = if save_idxs === nothing
-            out = DiffEqBase.sensitivity_solution(sol, _out.u, ts)
+            out = _sensitivity_solution(sol, state_values(_out), ts)
         else
-            out = DiffEqBase.sensitivity_solution(sol,
-                                                  [_out[i][save_idxs]
-                                                   for i in 1:length(_out)], ts)
+            _outf = getu(_out, save_idxs)
+            out = _sensitivity_solution(sol, _outf(_out), ts)
         end
         only_end = length(ts) == 1 && ts[1] == _prob.tspan[2]
     elseif isempty(saveat)
         no_start = !save_start
         no_end = !save_end
-        sol_idxs = 1:length(sol)
+        sol_idxs = 1:length(sol.u)
         no_start && (sol_idxs = sol_idxs[2:end])
         no_end && (sol_idxs = sol_idxs[1:(end - 1)])
         only_end = length(sol_idxs) <= 1
         _u = sol.u[sol_idxs]
         u = save_idxs === nothing ? _u : [x[save_idxs] for x in _u]
-        ts = sol.t[sol_idxs]
-        out = DiffEqBase.sensitivity_solution(sol, u, ts)
+        ts = current_time(sol, sol_idxs)
+        out = _sensitivity_solution(sol, u, ts)
     else
         _saveat = saveat isa Array ? sort(saveat) : saveat # for minibatching
         if cb === nothing
             _saveat = eltype(_saveat) <: typeof(prob.tspan[2]) ?
-                      convert.(typeof(_prob.tspan[2]), _saveat) : _saveat
+                convert.(typeof(_prob.tspan[2]), _saveat) : _saveat
             ts = _saveat
             _out = sol(ts)
         else
-            _ts, duplicate_iterator_times = separate_nonunique(sol.t)
+            _ts, duplicate_iterator_times = separate_nonunique(current_time(sol))
             _out, ts = out_and_ts(_saveat, duplicate_iterator_times, sol)
         end
 
         out = if save_idxs === nothing
-            out = DiffEqBase.sensitivity_solution(sol, _out.u, ts)
+            out = _sensitivity_solution(sol, state_values(_out), ts)
         else
-            out = DiffEqBase.sensitivity_solution(sol,
-                                                  [_out[i][save_idxs]
-                                                   for i in 1:length(_out)], ts)
+            _outf = getu(_out, save_idxs)
+            out = _sensitivity_solution(sol, _outf(_out), ts)
         end
         only_end = length(ts) == 1 && ts[1] == _prob.tspan[2]
     end
 
+    @reset out.prob = prob
+
     _save_idxs = save_idxs === nothing ? Colon() : save_idxs
 
     function adjoint_sensitivity_backpass(Δ)
+        Δ = Δ isa AbstractThunk ? unthunk(Δ) : Δ
+        Δu = Δ isa Union{Tangent, NamedTuple} ? unthunk.(tangent_field(Δ, :u)) : Δ
+        Δt = unthunk(tangent_field(Δ, :t))
+        # Saved time points that coincide with an event time move with the
+        # event time under parameter perturbation; the event correction in
+        # the reverse callbacks turns their cotangents into λ jumps.
+        dgdt_discrete = if Δt isa AbstractVector
+            function (t_event)
+                w = nothing
+                for i in eachindex(ts)
+                    ts[i] == t_event || continue
+                    x = unthunk(Δt[i])
+                    x isa Number || continue
+                    w = w === nothing ? x : w + x
+                end
+                return w
+            end
+        else
+            nothing
+        end
         function df_iip(_out, u, p, t, i)
-            outtype = typeof(_out) <: SubArray ?
-                      DiffEqBase.parameterless_type(_out.parent) :
-                      DiffEqBase.parameterless_type(_out)
-            if only_end
-                eltype(Δ) <: NoTangent && return
-                if typeof(Δ) <: AbstractArray{<:AbstractArray} && length(Δ) == 1 && i == 1
+            outtype = _out isa SubArray ?
+                ArrayInterface.parameterless_type(_out.parent) :
+                ArrayInterface.parameterless_type(_out)
+            (Δu === nothing || Δu isa AbstractZero) && return
+            return if only_end
+                eltype(Δu) <: NoTangent && return
+                if (
+                        Δu isa AbstractArray{<:AbstractArray} ||
+                            Δu isa AbstractVectorOfArray
+                    ) &&
+                        (Δu isa AbstractVectorOfArray ? length(Δu.u) : length(Δu)) == 1 && i == 1
                     # user did sol[end] on only_end
-                    if typeof(_save_idxs) <: Number
-                        x = vec(Δ[1])
-                        _out[_save_idxs] .= adapt(outtype, @view(x[_save_idxs]))
+                    x = Δu isa AbstractVectorOfArray ? Δu.u[1] : Δu[1]
+                    if _save_idxs isa Number
+                        vx = vec(x)
+                        _out[_save_idxs] .= vx[_save_idxs]
                     elseif _save_idxs isa Colon
-                        vec(_out) .= adapt(outtype, vec(Δ[1]))
+                        vec(_out) .= vec(adapt(outtype, x))
                     else
-                        vec(@view(_out[_save_idxs])) .= adapt(outtype,
-                                                              vec(Δ[1])[_save_idxs])
+                        vec(@view(_out[_save_idxs])) .= adapt(
+                            outtype,
+                            vec(x)[_save_idxs]
+                        )
                     end
                 else
                     Δ isa NoTangent && return
-                    if typeof(_save_idxs) <: Number
-                        x = vec(Δ)
+                    if _save_idxs isa Number
+                        x = vec(Δu)
                         _out[_save_idxs] .= adapt(outtype, @view(x[_save_idxs]))
                     elseif _save_idxs isa Colon
-                        vec(_out) .= adapt(outtype, vec(Δ))
+                        vec(_out) .= vec(adapt(outtype, Δu))
                     else
-                        x = vec(Δ)
+                        x = vec(Δu)
                         vec(@view(_out[_save_idxs])) .= adapt(outtype, @view(x[_save_idxs]))
                     end
                 end
             else
                 !Base.isconcretetype(eltype(Δ)) &&
-                    (Δ[i] isa NoTangent || eltype(Δ) <: NoTangent) && return
-                if typeof(Δ) <: AbstractArray{<:AbstractArray} || typeof(Δ) <: DESolution
-                    x = Δ[i]
-                    if typeof(_save_idxs) <: Number
-                        _out[_save_idxs] = @view(x[_save_idxs])
+                    ((Δu isa AbstractVectorOfArray ? Δu.u[i] : Δu[i]) isa NoTangent || eltype(Δu) <: NoTangent) && return
+                if Δ isa AbstractArray{<:AbstractArray} || Δ isa AbstractVectorOfArray ||
+                        Δ isa Union{Tangent, NamedTuple}
+                    x = Δ isa AbstractVectorOfArray ? Δu.u[i] :
+                        (Δ isa Union{Tangent, NamedTuple} ? Δu[i] : Δ[i])
+                    if _save_idxs isa Number
+                        _out[_save_idxs] = x[_save_idxs]
                     elseif _save_idxs isa Colon
-                        vec(_out) .= vec(x)
+                        vec(_out) .= (x isa NoTangent || x isa ZeroTangent) ? vec(zero(u)) :
+                            vec(x)
                     else
                         vec(@view(_out[_save_idxs])) .= vec(@view(x[_save_idxs]))
                     end
                 else
-                    if typeof(_save_idxs) <: Number
-                        _out[_save_idxs] = adapt(outtype,
-                                                 reshape(Δ, prod(size(Δ)[1:(end - 1)]),
-                                                         size(Δ)[end])[_save_idxs, i])
+                    if _save_idxs isa Number
+                        _out[_save_idxs] = adapt(
+                            outtype,
+                            reshape(
+                                Δ, prod(size(Δ)[1:(end - 1)]),
+                                size(Δ)[end]
+                            )[
+                                _save_idxs,
+                                i,
+                            ]
+                        )
                     elseif _save_idxs isa Colon
-                        vec(_out) .= vec(adapt(outtype,
-                                               reshape(Δ, prod(size(Δ)[1:(end - 1)]),
-                                                       size(Δ)[end])[:, i]))
+                        vec(_out) .= vec(
+                            adapt(
+                                outtype,
+                                reshape(
+                                    Δ, prod(size(Δ)[1:(end - 1)]),
+                                    size(Δ)[end]
+                                )[:, i]
+                            )
+                        )
                     else
-                        vec(@view(_out[_save_idxs])) .= vec(adapt(outtype,
-                                                                  reshape(Δ,
-                                                                          prod(size(Δ)[1:(end - 1)]),
-                                                                          size(Δ)[end])[:,
-                                                                                        i]))
+                        vec(@view(_out[_save_idxs])) .= vec(
+                            adapt(
+                                outtype,
+                                reshape(
+                                    Δ,
+                                    prod(size(Δ)[1:(end - 1)]),
+                                    size(Δ)[end]
+                                )[
+                                    :,
+                                    i,
+                                ]
+                            )
+                        )
                     end
                 end
             end
         end
 
         function df_oop(u, p, t, i; outtype = nothing)
+            (Δu === nothing || Δu isa AbstractZero) && return zero(u)
             if only_end
-                eltype(Δ) <: NoTangent && return
-                if typeof(Δ) <: AbstractArray{<:AbstractArray} && length(Δ) == 1 && i == 1
+                eltype(Δu) <: NoTangent && return
+                if (Δu isa AbstractArray{<:AbstractArray} || Δu isa AbstractVectorOfArray) &&
+                        (Δu isa AbstractVectorOfArray ? length(Δu.u) : length(Δu)) == 1 && i == 1
                     # user did sol[end] on only_end
-                    if typeof(_save_idxs) <: Number
-                        x = vec(Δ[1])
-                        _out = adapt(outtype, @view(x[_save_idxs]))
+                    x = Δu isa AbstractVectorOfArray ? Δu.u[1] : Δu[1]
+                    if _save_idxs isa Number
+                        vx = vec(x)
+                        _out = adapt(outtype, @view(vx[_save_idxs]))
                     elseif _save_idxs isa Colon
-                        _out = adapt(outtype, vec(Δ[1]))
+                        _out = adapt(outtype, x)
                     else
-                        _out = adapt(outtype,
-                                     vec(Δ[1])[_save_idxs])
+                        _out = adapt(outtype, vec(x)[_save_idxs])
                     end
                 else
                     Δ isa NoTangent && return
-                    if typeof(_save_idxs) <: Number
-                        x = vec(Δ)
+                    if _save_idxs isa Number
+                        x = vec(Δu)
                         _out = adapt(outtype, @view(x[_save_idxs]))
                     elseif _save_idxs isa Colon
-                        _out = adapt(outtype, vec(Δ))
+                        _out = adapt(outtype, vec(Δu))
                     else
-                        x = vec(Δ)
+                        x = vec(Δu)
                         _out = adapt(outtype, @view(x[_save_idxs]))
                     end
                 end
             else
                 !Base.isconcretetype(eltype(Δ)) &&
-                    (Δ[i] isa NoTangent || eltype(Δ) <: NoTangent) && return
-                if typeof(Δ) <: AbstractArray{<:AbstractArray} || typeof(Δ) <: DESolution
-                    x = Δ[i]
-                    if typeof(_save_idxs) <: Number
+                    ((Δu isa AbstractVectorOfArray ? Δu.u[i] : Δu[i]) isa NoTangent || eltype(Δu) <: NoTangent) && return
+                if Δ isa AbstractArray{<:AbstractArray} || Δ isa AbstractVectorOfArray ||
+                        Δ isa Union{Tangent, NamedTuple}
+                    x = Δu isa AbstractVectorOfArray ? Δu.u[i] : Δu[i]
+                    if _save_idxs isa Number
                         _out = @view(x[_save_idxs])
                     elseif _save_idxs isa Colon
-                        _out = vec(x)
+                        _out = (x isa NoTangent || x isa ZeroTangent) ? vec(zero(u)) : vec(x)
                     else
                         _out = vec(@view(x[_save_idxs]))
                     end
                 else
-                    if typeof(_save_idxs) <: Number
-                        _out = adapt(outtype,
-                                     reshape(Δ, prod(size(Δ)[1:(end - 1)]),
-                                             size(Δ)[end])[_save_idxs, i])
+                    if _save_idxs isa Number
+                        _out = adapt(
+                            outtype,
+                            reshape(
+                                Δ, prod(size(Δ)[1:(end - 1)]),
+                                size(Δ)[end]
+                            )[
+                                _save_idxs,
+                                i,
+                            ]
+                        )
                     elseif _save_idxs isa Colon
-                        _out = vec(adapt(outtype,
-                                         reshape(Δ, prod(size(Δ)[1:(end - 1)]),
-                                                 size(Δ)[end])[:, i]))
+                        _out = vec(
+                            adapt(
+                                outtype,
+                                reshape(
+                                    Δ, prod(size(Δ)[1:(end - 1)]),
+                                    size(Δ)[end]
+                                )[:, i]
+                            )
+                        )
                     else
-                        _out = vec(adapt(outtype,
-                                         reshape(Δ,
-                                                 prod(size(Δ)[1:(end - 1)]),
-                                                 size(Δ)[end])[:, i]))
+                        _out = vec(
+                            adapt(
+                                outtype,
+                                reshape(
+                                    Δ,
+                                    prod(size(Δ)[1:(end - 1)]),
+                                    size(Δ)[end]
+                                )[:, i]
+                            )
+                        )
                     end
                 end
             end
@@ -497,81 +1050,194 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
         else
             cb2 = cb
         end
-        if ArrayInterface.ismutable(eltype(sol.u))
-            du0, dp = adjoint_sensitivities(sol, alg, args...; t = ts,
-                                            dgdu_discrete = df_iip,
-                                            sensealg = sensealg,
-                                            callback = cb2,
-                                            kwargs_adj...)
+
+        if prob isa DAEProblem
+            # The adjoint problem's own kwargs carry the correct `initializealg`
+            # for its index (Brown for index-1, NoInit for index-2), so don't
+            # override it here.
+            du0,
+                dp = adjoint_sensitivities(
+                sol, alg, args...; t = ts,
+                dgdu_discrete = ArrayInterface.ismutable(eltype(state_values(sol))) ?
+                    df_iip : df_oop,
+                dgdt_discrete,
+                sensealg,
+                callback = cb2, no_start = !save_start && _prob.tspan[1] ∈ ts,
+                kwargs_init...
+            )
+        elseif prob isa ODEProblem
+            du0,
+                dp = adjoint_sensitivities(
+                sol, alg, args...; t = ts,
+                dgdu_discrete = ArrayInterface.ismutable(eltype(state_values(sol))) ?
+                    df_iip : df_oop,
+                dgdt_discrete,
+                sensealg,
+                callback = cb2, no_start = !save_start && _prob.tspan[1] ∈ ts,
+                initializealg = BrownFullBasicInit(),
+                kwargs_init...
+            )
         else
-            du0, dp = adjoint_sensitivities(sol, alg, args...; t = ts,
-                                            dgdu_discrete = df_oop,
-                                            sensealg = sensealg,
-                                            callback = cb2,
-                                            kwargs_adj...)
+            du0,
+                dp = adjoint_sensitivities(
+                sol, alg, args...; t = ts,
+                dgdu_discrete = ArrayInterface.ismutable(eltype(state_values(sol))) ?
+                    df_iip : df_oop,
+                sensealg,
+                callback = cb2, no_start = !save_start && _prob.tspan[2] ∈ ts,
+                kwargs_init...
+            )
         end
 
         du0 = reshape(du0, size(u0))
-        dp = p === nothing || p === DiffEqBase.NullParameters() ? nothing :
-             reshape(dp', size(p))
 
-        if originator isa SciMLBase.TrackerOriginator ||
-           originator isa SciMLBase.ReverseDiffOriginator
-            (NoTangent(), NoTangent(), du0, dp, NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+        dp_full = if p === nothing || p === SciMLBase.NullParameters()
+            nothing
+        elseif dp isa AbstractArray
+            reshape(dp', size(tunables))
         else
-            (NoTangent(), NoTangent(), NoTangent(), du0, dp, NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+            dp
+        end
+
+        # When diff_tunables=Val(false), dp_full is the full parameter
+        # gradient (SciMLStructure). Return it as a NamedTuple tangent so
+        # the AD reverse rule can accumulate into all shadow components.
+        # This applies to all originators — diff_tunables=Val(false) is
+        # itself opt-in.
+        _use_full_p = hasproperty(sensealg, :diff_tunables) &&
+            sensealg.diff_tunables isa Val{false}
+        dp_tangent = if _use_full_p && isscimlstructure(dp_full)
+            accumulated = Zygote.accum(dp_full, igs)
+            originator isa SciMLBase.EnzymeOriginator ? accumulated : to_nt(accumulated)
+        else
+            dp = Zygote.accum(dp_full, igs)
+            # The loss may depend on `p` directly through the solution object, e.g. via an
+            # observed variable; that part arrives in `Δ.prob.p` rather than `Δ.u`.
+            dp = Zygote.accum(
+                dp, tunable_cotangent(p, solution_parameter_cotangent(Δ))
+            )
+
+            _,
+                repack_adjoint = if p === nothing || p === SciMLBase.NullParameters()
+                nothing, x -> (x,)
+            elseif isscimlstructure(p)
+                Zygote.pullback(p) do p
+                    t, _, _ = canonicalize(Tunable(), p)
+                    t
+                end
+            elseif isfunctor(p) && supports_functor_params(sensealg)
+                Zygote.pullback(p) do p
+                    t, _ = Functors.functor(p)
+                    t
+                end
+            else
+                nothing, x -> (x,)
+            end
+
+            # Repack the flat tunable cotangent `dp` into the parameter's
+            # structural tangent (a NamedTuple for MTKParameters; identity for
+            # plain-array params). The EnzymeOriginator `solve_up` reverse rule
+            # accumulates structural tangents field-wise, so returning a flat
+            # vector here broadcasts against the structured shadow (e.g. an
+            # `MTKParameters`) and errors.
+            repack_adjoint(dp)[1]
+        end
+
+        return if originator isa SciMLBase.TrackerOriginator ||
+                originator isa SciMLBase.ReverseDiffOriginator
+            (
+                NoTangent(), NoTangent(), du0, dp_tangent, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        else
+            (
+                NoTangent(), NoTangent(), NoTangent(),
+                du0, dp_tangent, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
         end
     end
-    out, adjoint_sensitivity_backpass
+    return out, adjoint_sensitivity_backpass
 end
 
 # Prefer this route since it works better with callback AD
-function DiffEqBase._concrete_solve_adjoint(prob::SciMLBase.AbstractODEProblem, alg,
-                                            sensealg::ForwardSensitivity,
-                                            u0, p, originator::SciMLBase.ADOriginator,
-                                            args...;
-                                            save_idxs = nothing,
-                                            kwargs...)
-    if !(typeof(p) <: Union{Nothing, SciMLBase.NullParameters, AbstractArray}) ||
-       (p isa AbstractArray && !Base.isconcretetype(eltype(p)))
-        throw(ForwardSensitivityParameterCompatibilityError())
+function SciMLBase._concrete_solve_adjoint(
+        prob::SciMLBase.AbstractODEProblem, alg,
+        sensealg::ForwardSensitivity,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...;
+        save_idxs = nothing,
+        kwargs...
+    )
+    if p === nothing || p isa SciMLBase.NullParameters
+        tunables, repack = p, identity
+    elseif isscimlstructure(p)
+        tunables, repack, _ = canonicalize(Tunable(), p)
+    else
+        throw(SciMLStructuresCompatibilityError())
     end
 
-    if p isa AbstractArray && eltype(p) <: ForwardDiff.Dual &&
-       !(eltype(u0) <: ForwardDiff.Dual)
+    if tunables isa AbstractArray && eltype(tunables) <: ForwardDiff.Dual &&
+            !(eltype(u0) <: ForwardDiff.Dual)
         # Handle double differentiation case
         u0 = eltype(p).(u0)
     end
 
     ## Force recompile mode until jvps are specialized to handle this!!!
     _f = if prob.f isa ODEFunction &&
-            (prob.f.f isa FunctionWrappersWrappers.FunctionWrappersWrapper ||
-             SciMLBase.specialization(prob.f) === SciMLBase.AutoSpecialize)
-        ODEFunction{isinplace(prob), SciMLBase.FullSpecialize}(unwrapped_f(prob.f))
+            (
+            prob.f.f isa FunctionWrappersWrappers.FunctionWrappersWrapper ||
+                SciMLBase.specialization(prob.f) === SciMLBase.AutoSpecialize
+        )
+        ODEFunction{isinplace(prob), SciMLBase.FullSpecialize}(
+            unwrapped_f(prob.f);
+            mass_matrix = prob.f.mass_matrix,
+            analytic = prob.f.analytic,
+            tgrad = prob.f.tgrad,
+            jac = prob.f.jac,
+            jac_prototype = prob.f.jac_prototype,
+            sparsity = prob.f.sparsity,
+            paramjac = prob.f.paramjac,
+            colorvec = prob.f.colorvec
+        )
     else
         prob.f
     end
 
-    _prob = ODEForwardSensitivityProblem(_f, u0, prob.tspan, p, sensealg)
+    # callback = nothing ensures only the callback in kwargs is used
+    _prob = ODEForwardSensitivityProblem(
+        _f, u0, prob.tspan, p; sensealg, callback = nothing
+    )
     sol = solve(_prob, alg, args...; kwargs...)
     _, du = extract_local_sensitivities(sol, sensealg, Val(true))
+    ts = current_time(sol)
 
     u = if save_idxs === nothing
-        [reshape(sol[i][1:length(u0)], size(u0)) for i in 1:length(sol)]
+        uf = getu(sol, 1:length(u0))
+        reshape.(uf(sol), Ref(size(u0)))
     else
-        [sol[i][_save_idxs] for i in 1:length(sol)]
+        uf = getu(sol, _save_idxs)
+        uf(sol)
     end
-    out = DiffEqBase.sensitivity_solution(sol, u, sol.t)
+    out = SciMLBase.sensitivity_solution(sol, u, ts)
+
+    if originator isa SciMLBase.EnzymeOriginator
+        @reset out.prob = prob
+    end
 
     function forward_sensitivity_backpass(Δ)
+        Δ = Δ isa AbstractThunk ? unthunk(Δ) : Δ
         adj = sum(eachindex(du)) do i
             J = du[i]
-            if Δ isa AbstractVector || Δ isa DESolution || Δ isa AbstractVectorOfArray
+            if Δ isa AbstractVector
                 v = Δ[i]
+            elseif Δ isa AbstractTimeseriesSolution || Δ isa AbstractVectorOfArray ||
+                    Δ isa Tangent
+                v = Δ.u[i]
             elseif Δ isa AbstractMatrix
                 v = @view Δ[:, i]
+            elseif Δ isa Number
+                v = fill(Δ, size(J, 1))
             else
                 v = @view Δ[.., i]
             end
@@ -580,69 +1246,156 @@ function DiffEqBase._concrete_solve_adjoint(prob::SciMLBase.AbstractODEProblem, 
 
         du0 = @not_implemented("ForwardSensitivity does not differentiate with respect to u0. Change your sensealg.")
 
-        if originator isa SciMLBase.TrackerOriginator ||
-           originator isa SciMLBase.ReverseDiffOriginator
-            (NoTangent(), NoTangent(), du0, adj, NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+        return if originator isa SciMLBase.TrackerOriginator ||
+                originator isa SciMLBase.ReverseDiffOriginator
+            (
+                NoTangent(), NoTangent(), du0, adj, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
         else
-            (NoTangent(), NoTangent(), NoTangent(), du0, adj, NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+            (
+                NoTangent(), NoTangent(), NoTangent(), du0, adj, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
         end
     end
-    out, forward_sensitivity_backpass
+    return out, forward_sensitivity_backpass
 end
 
-function DiffEqBase._concrete_solve_forward(prob::SciMLBase.AbstractODEProblem, alg,
-                                            sensealg::AbstractForwardSensitivityAlgorithm,
-                                            u0, p, originator::SciMLBase.ADOriginator,
-                                            args...; save_idxs = nothing,
-                                            kwargs...)
-    _prob = ODEForwardSensitivityProblem(prob.f, u0, prob.tspan, p, sensealg)
+# Mooncake-specific `ForwardSensitivity` path. The main method builds an
+# `ODEForwardSensitivityProblem` whose `f` is an
+# `ODEForwardSensitivityFunction` carrying ForwardDiff internals
+# (`ForwardDiff.JacobianConfig`, `Dual` caches, …) in its type parameters.
+# The returned `sensitivity_solution(augmented_sol, u, ts)` inherits those
+# types in `sol.prob.f`, which confuses Mooncake's `@from_rrule` tangent
+# recursion the same way the tracked types in `ReverseDiffAdjoint` /
+# `TrackerAdjoint` do. Delegate to the `ChainRulesOriginator` path for the
+# sensitivity tape and re-solve the plain problem for the primal.
+#
+# A tempting alternative is to walk the returned `primal` and strip
+# tracked / augmented types via `SciMLBase.value` recursively. That
+# approach *almost* works but fails on one specific slot: `solve()` wraps
+# `prob.f` in a `FunctionWrappersWrappers.FunctionWrappersWrapper` during
+# `get_concrete_problem`, and the resulting `FunctionWrapper` has no
+# public positional constructor for `ConstructionBase.setproperties`, so a
+# generic walker can't rebuild it. Mooncake's `@from_rrule` type
+# inference nonetheless expects the `FunctionWrapper` version (because
+# that's what `solve()` returns), so anything less than actually invoking
+# `solve()` produces a type mismatch on the `DerivedRule` assertion.
+# A truly general `strip_values(sol)` in SciMLBase would need the same
+# `solve()` round-trip internally, so the cost is unavoidable here.
+#
+# Additionally, the main `forward_sensitivity_backpass` returns `du0 =
+# @not_implemented(...)` because `ForwardSensitivity` can't differentiate
+# w.r.t. `u0`. Mooncake's `@from_rrule` plumbing then tries to convert that
+# `ChainRulesCore.NotImplemented` tangent back through
+# `increment_and_get_rdata!` against the `Vector{Float64}` fdata of `u0`,
+# and Mooncake doesn't have a method for that combination (only scalar
+# `IEEEFloat` + `NotImplemented` is handled). Since Mooncake will dutifully
+# thread the cotangent of *every* argument through `increment_and_get_rdata!`
+# regardless of whether the caller is actually differentiating `u0`, we
+# replace the `du0` slot in the delegated ChainRules pullback with
+# `NoTangent()` so the Mooncake conversion has a shape it understands. Any
+# caller that genuinely differentiates `u0` while using `ForwardSensitivity`
+# is already using the wrong sensealg (the main method's error message says
+# as much).
+function SciMLBase._concrete_solve_adjoint(
+        prob::SciMLBase.AbstractODEProblem, alg,
+        sensealg::ForwardSensitivity,
+        u0, p, originator::SciMLBase.MooncakeOriginator,
+        args...; kwargs...
+    )
+    _, backpass = SciMLBase._concrete_solve_adjoint(
+        prob, alg, sensealg, u0, p,
+        SciMLBase.ChainRulesOriginator(), args...; kwargs...
+    )
+    # ChainRules branch of `forward_sensitivity_backpass` returns
+    # `(NoTangent(), NoTangent(), NoTangent(), du0, adj, NoTangent(), rest...)`.
+    # Replace position 4 (`du0`) with `NoTangent()`.
+    function mooncake_forward_sensitivity_backpass(Δ)
+        cr = backpass(Δ)
+        return (cr[1], cr[2], cr[3], NoTangent(), cr[5:end]...)
+    end
+    kwargs_filtered = NamedTuple(filter(x -> x[1] != :sensealg, kwargs))
+    primal = solve(
+        remake(prob; u0, p), alg, args...;
+        sensealg = DiffEqBase.SensitivityADPassThrough(), wrap = Val(false),
+        kwargs_filtered...
+    )
+    return primal, mooncake_forward_sensitivity_backpass
+end
+
+function SciMLBase._concrete_solve_forward(
+        prob::SciMLBase.AbstractODEProblem, alg,
+        sensealg::AbstractForwardSensitivityAlgorithm,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; save_idxs = nothing,
+        kwargs...
+    )
+    _prob = ODEForwardSensitivityProblem(
+        prob.f, u0, prob.tspan, p; sensealg, callback = nothing
+    )
     sol = solve(_prob, args...; kwargs...)
+
+    if originator isa SciMLBase.EnzymeOriginator
+        @reset sol.prob = prob
+    end
+
     u, du = extract_local_sensitivities(sol, Val(true))
     _save_idxs = save_idxs === nothing ? (1:length(u0)) : save_idxs
-    out = DiffEqBase.sensitivity_solution(sol,
-                                          [ForwardDiff.value.(sol[i][_save_idxs])
-                                           for i in 1:length(sol)], sol.t)
+    ts = current_time(sol)
+    uf = getu(sol, _save_idxs)
+    out = SciMLBase.sensitivity_solution(
+        sol,
+        ForwardDiff.value.(uf(sol, 1:length(sol.u))), ts
+    )
     function _concrete_solve_pushforward(Δself, ::Nothing, ::Nothing, x3, Δp, args...)
         x3 !== nothing && error("Pushforward currently requires no u0 derivatives")
-        du * Δp
+        return du * Δp
     end
-    out, _concrete_solve_pushforward
+    return out, _concrete_solve_pushforward
 end
 
-const FORWARDDIFF_SENSITIVITY_PARAMETER_COMPATABILITY_MESSAGE = """
-                                                                ForwardDiffSensitivity assumes the `AbstractArray` interface for `p`. Thus while
-                                                                DifferentialEquations.jl can support any parameter struct type, usage
-                                                                with ForwardDiffSensitivity requires that `p` could be a valid
-                                                                type for being the initial condition `u0` of an array. This means that
-                                                                many simple types, such as `Tuple`s and `NamedTuple`s, will work as
-                                                                parameters in normal contexts but will fail during ForwardDiffSensitivity
-                                                                construction. To work around this issue for complicated cases like nested structs,
-                                                                look into defining `p` using `AbstractArray` libraries such as RecursiveArrayTools.jl
-                                                                or ComponentArrays.jl.
-                                                                """
+const FORWARDDIFF_SENSITIVITY_PARAMETER_COMPATIBILITY_MESSAGE = """
+ForwardDiffSensitivity assumes the `AbstractArray` interface for `p`. Thus while
+DifferentialEquations.jl can support any parameter struct type, usage
+with ForwardDiffSensitivity requires that `p` could be a valid
+type for being the initial condition `u0` of an array. This means that
+many simple types, such as `Tuple`s and `NamedTuple`s, will work as
+parameters in normal contexts but will fail during ForwardDiffSensitivity
+construction. To work around this issue for complicated cases like nested structs,
+look into defining `p` using `AbstractArray` libraries such as RecursiveArrayTools.jl
+or ComponentArrays.jl.
+"""
 
 struct ForwardDiffSensitivityParameterCompatibilityError <: Exception end
 
 function Base.showerror(io::IO, e::ForwardDiffSensitivityParameterCompatibilityError)
-    print(io, FORWARDDIFF_SENSITIVITY_PARAMETER_COMPATABILITY_MESSAGE)
+    return print(io, FORWARDDIFF_SENSITIVITY_PARAMETER_COMPATIBILITY_MESSAGE)
 end
 
 # Generic Fallback for ForwardDiff
-function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEProblem,
-                                                        SciMLBase.AbstractDAEProblem,
-                                                        SciMLBase.AbstractDDEProblem,
-                                                        SciMLBase.AbstractSDEProblem,
-                                                        SciMLBase.AbstractSDDEProblem,
-                                                        SciMLBase.AbstractRODEProblem}, alg,
-                                            sensealg::ForwardDiffSensitivity{CS, CTS},
-                                            u0, p, originator::SciMLBase.ADOriginator,
-                                            args...; saveat = eltype(prob.tspan)[],
-                                            kwargs...) where {CS, CTS}
-    if !(typeof(p) <: Union{Nothing, SciMLBase.NullParameters, AbstractArray}) ||
-       (p isa AbstractArray && !Base.isconcretetype(eltype(p)))
-        throw(ForwardDiffSensitivityParameterCompatibilityError())
+function SciMLBase._concrete_solve_adjoint(
+        prob::Union{
+            SciMLBase.AbstractODEProblem,
+            SciMLBase.AbstractDAEProblem,
+            SciMLBase.AbstractDDEProblem,
+            SciMLBase.AbstractSDEProblem,
+            SciMLBase.AbstractSDDEProblem,
+            SciMLBase.AbstractRODEProblem,
+        },
+        alg,
+        sensealg::ForwardDiffSensitivity{CS, CTS},
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; saveat = eltype(prob.tspan)[],
+        kwargs...
+    ) where {CS, CTS}
+    if p === nothing || p isa SciMLBase.NullParameters
+        tunables, repack = p, identity
+    elseif isscimlstructure(p)
+        tunables, repack, _ = canonicalize(Tunable(), p)
+    else
+        throw(SciMLStructuresCompatibilityError())
     end
 
     if saveat isa Number
@@ -651,59 +1404,79 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
         _saveat = saveat
     end
 
-    sol = solve(remake(prob, p = p, u0 = u0), alg, args...; saveat = _saveat, kwargs...)
+    # use the callback in kwargs, not prob
+    kwargs_prob = NamedTuple(filter(x -> x[1] != :callback, prob.kwargs))
+    _prob = remake(prob; p, u0, kwargs = kwargs_prob)
+    sol = solve(_prob, alg, args...; saveat = _saveat, wrap = Val(false), kwargs...)
+
+    if originator isa SciMLBase.EnzymeOriginator
+        @reset sol.prob = prob
+    end
 
     # saveat values
     # need all values here. Not only unique ones.
     # if a callback is saving two times in primal solution, we also need to get it at least
     # two times in the solution using dual numbers.
-    ts = sol.t
+    ts = current_time(sol)
 
     function forward_sensitivity_backpass(Δ)
-        if !(p === nothing || p === DiffEqBase.NullParameters())
+        Δ = Δ isa AbstractThunk ? unthunk(Δ) : Δ
+        if !(p === nothing || p === SciMLBase.NullParameters())
             dp = @thunk begin
-                chunk_size = if CS === 0 && length(p) < 12
-                    length(p)
+                chunk_size = if CS === 0 && length(tunables) < 12
+                    length(tunables)
                 elseif CS !== 0
                     CS
                 else
                     12
                 end
 
-                num_chunks = length(p) ÷ chunk_size
-                num_chunks * chunk_size != length(p) && (num_chunks += 1)
+                num_chunks = length(tunables) ÷ chunk_size
+                num_chunks * chunk_size != length(tunables) && (num_chunks += 1)
 
-                pparts = typeof(p[1:1])[]
+                pparts = typeof(tunables[1:1])[]
                 for j in 0:(num_chunks - 1)
                     local chunk
-                    if ((j + 1) * chunk_size) <= length(p)
+                    if ((j + 1) * chunk_size) <= length(tunables)
                         chunk = ((j * chunk_size + 1):((j + 1) * chunk_size))
-                        pchunk = vec(p)[chunk]
-                        pdualpart = seed_duals(pchunk, prob.f,
-                                               ForwardDiff.Chunk{chunk_size}())
+                        pchunk = vec(tunables)[chunk]
+                        pdualpart = seed_duals(
+                            pchunk, prob.f,
+                            ForwardDiff.Chunk{chunk_size}()
+                        )
                     else
-                        chunk = ((j * chunk_size + 1):length(p))
-                        pchunk = vec(p)[chunk]
-                        pdualpart = seed_duals(pchunk, prob.f,
-                                               ForwardDiff.Chunk{length(chunk)}())
+                        chunk = ((j * chunk_size + 1):length(tunables))
+                        pchunk = vec(tunables)[chunk]
+                        pdualpart = seed_duals(
+                            pchunk, prob.f,
+                            ForwardDiff.Chunk{length(chunk)}()
+                        )
                     end
 
                     pdualvec = if j == 0
-                        vcat(pdualpart, p[((j + 1) * chunk_size + 1):end])
+                        vcat(pdualpart, tunables[((j + 1) * chunk_size + 1):end])
                     elseif j == num_chunks - 1
-                        vcat(p[1:(j * chunk_size)], pdualpart)
+                        vcat(tunables[1:(j * chunk_size)], pdualpart)
                     else
-                        vcat(p[1:(j * chunk_size)], pdualpart,
-                             p[(((j + 1) * chunk_size) + 1):end])
+                        vcat(
+                            tunables[1:(j * chunk_size)], pdualpart,
+                            tunables[(((j + 1) * chunk_size) + 1):end]
+                        )
                     end
 
-                    pdual = ArrayInterface.restructure(p, pdualvec)
+                    pdual = SciMLStructures.replace(Tunable(), p, pdualvec)
                     u0dual = convert.(eltype(pdualvec), u0)
 
-                    if (convert_tspan(sensealg) === nothing &&
-                        ((haskey(kwargs, :callback) &&
-                          has_continuous_callback(kwargs[:callback])))) ||
-                       (convert_tspan(sensealg) !== nothing && convert_tspan(sensealg))
+                    if (
+                            convert_tspan(sensealg) === nothing &&
+                                (
+                                (
+                                    haskey(kwargs, :callback) &&
+                                        has_continuous_callback(kwargs[:callback])
+                                )
+                            )
+                        ) ||
+                            (convert_tspan(sensealg) !== nothing && convert_tspan(sensealg))
                         tspandual = convert.(eltype(pdual), prob.tspan)
                     else
                         tspandual = prob.tspan
@@ -711,30 +1484,31 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
 
                     ## Force recompile mode because it won't handle the duals
                     ## Would require a manual tag to be applied
-                    if typeof(prob.f) <: ODEFunction
-                        if prob.f.jac_prototype !== nothing
-                            _f = ODEFunction{SciMLBase.isinplace(prob.f),
-                                             SciMLBase.FullSpecialize}(unwrapped_f(prob.f),
-                                                                       jac_prototype = convert.(eltype(u0dual),
-                                                                                                prob.f.jac_prototype))
-                        else
-                            _f = ODEFunction{SciMLBase.isinplace(prob.f),
-                                             SciMLBase.FullSpecialize}(unwrapped_f(prob.f))
-                        end
-                    elseif typeof(prob.f) <: SDEFunction && prob.f.jac_prototype !== nothing
-                        _f = SDEFunction{SciMLBase.isinplace(prob.f),
-                                         SciMLBase.FullSpecialize}(unwrapped_f(prob.f),
-                                                                   jac_prototype = convert.(eltype(u0dual),
-                                                                                            prob.f.jac_prototype))
+                    _f = _dual_f(prob.f, eltype(u0dual))
+                    # use the callback from kwargs, not prob
+                    _prob = if prob isa SDEProblem
+                        remake(
+                            prob, f = _f, g = unwrapped_f(prob.g),
+                            u0 = u0dual, p = pdual,
+                            tspan = tspandual, callback = nothing
+                        )
                     else
-                        _f = prob.f
+                        remake(
+                            prob, f = _f, u0 = u0dual, p = pdual,
+                            tspan = tspandual, callback = nothing
+                        )
                     end
-                    _prob = remake(prob, f = _f, u0 = u0dual, p = pdual, tspan = tspandual)
 
                     if _prob isa SDEProblem
-                        _prob.noise_rate_prototype !== nothing && (_prob = remake(_prob,
-                                        noise_rate_prototype = convert.(eltype(pdual),
-                                                                        _prob.noise_rate_prototype)))
+                        _prob.noise_rate_prototype !== nothing && (
+                            _prob = remake(
+                                _prob,
+                                noise_rate_prototype = convert.(
+                                    eltype(pdual),
+                                    _prob.noise_rate_prototype
+                                )
+                            )
+                        )
                     end
 
                     if saveat isa Number
@@ -743,7 +1517,7 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
                         _saveat = saveat
                     end
 
-                    _sol = solve(_prob, alg, args...; saveat = ts, kwargs...)
+                    _sol = solve(_prob, alg, args...; saveat = ts, wrap = Val(false), kwargs...)
                     _, du = extract_local_sensitivities(_sol, sensealg, Val(true))
 
                     if haskey(kwargs, :callback)
@@ -753,47 +1527,52 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
                         # First step: filter all values, so that only time steps that actually occur
                         # in the primal are left. This is for example necessary when `terminate!`
                         # is used.
-                        indxs = findall(t -> t ∈ ts, _sol.t)
-                        _ts = _sol.t[indxs]
+                        idxs = findall(t -> t ∈ ts, current_time(_sol))
+                        _ts = current_time(_sol, idxs)
                         # after this filtering step, we might end up with a too large amount of indices.
                         # For example, if a callback saved values in the primal, then we now potentially
                         # save it by `saveat` and by `save_positions` of the callback.
                         # Second step. Drop these duplicates values.
-                        if length(indxs) != length(ts)
+                        if length(idxs) != length(ts)
                             for i in (length(_ts) - 1):-1:2
                                 if _ts[i] == _ts[i + 1] && _ts[i] == _ts[i - 1]
-                                    deleteat!(indxs, i)
+                                    deleteat!(idxs, i)
                                 end
                             end
                         end
-                        _du = @view du[indxs]
+                        _du = @view du[idxs]
                     else
                         _du = du
                     end
 
                     _dp = sum(eachindex(_du)) do i
                         J = _du[i]
-                        if Δ isa AbstractVector || Δ isa DESolution ||
-                           Δ isa AbstractVectorOfArray
+                        if Δ isa AbstractVector
                             v = Δ[i]
+                        elseif Δ isa AbstractVectorOfArray || Δ isa Tangent
+                            v = Δ.u[i]
                         elseif Δ isa AbstractMatrix
                             v = @view Δ[:, i]
+                        elseif Δ isa Number
+                            v = fill(Δ, size(J, 1))
                         else
                             v = @view Δ[.., i]
                         end
-                        if !(Δ isa NoTangent)
+                        if !(Δ isa NoTangent || v isa ZeroTangent)
                             if u0 isa Number
                                 ForwardDiff.value.(J'v)
+                            elseif v isa Tangent
+                                ForwardDiff.value.(J'vec(v.x))
                             else
                                 ForwardDiff.value.(J'vec(v))
                             end
                         else
-                            zero(p)
+                            zero(v)
                         end
                     end
                     push!(pparts, vec(_dp))
                 end
-                ArrayInterface.restructure(p, reduce(vcat, pparts))
+                reduce(vcat, pparts)
             end
         else
             dp = nothing
@@ -818,18 +1597,24 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
             for j in 0:(num_chunks - 1)
                 local chunk
                 if u0 isa Number
-                    u0dualpart = seed_duals(u0, prob.f,
-                                            ForwardDiff.Chunk{chunk_size}())
+                    u0dualpart = seed_duals(
+                        u0, prob.f,
+                        ForwardDiff.Chunk{chunk_size}()
+                    )
                 elseif ((j + 1) * chunk_size) <= length(u0)
                     chunk = ((j * chunk_size + 1):((j + 1) * chunk_size))
                     u0chunk = vec(u0)[chunk]
-                    u0dualpart = seed_duals(u0chunk, prob.f,
-                                            ForwardDiff.Chunk{chunk_size}())
+                    u0dualpart = seed_duals(
+                        u0chunk, prob.f,
+                        ForwardDiff.Chunk{chunk_size}()
+                    )
                 else
                     chunk = ((j * chunk_size + 1):length(u0))
                     u0chunk = vec(u0)[chunk]
-                    u0dualpart = seed_duals(u0chunk, prob.f,
-                                            ForwardDiff.Chunk{length(chunk)}())
+                    u0dualpart = seed_duals(
+                        u0chunk, prob.f,
+                        ForwardDiff.Chunk{length(chunk)}()
+                    )
                 end
 
                 if u0 isa Number
@@ -840,22 +1625,31 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
                     elseif j == num_chunks - 1
                         vcat(u0[1:(j * chunk_size)], u0dualpart)
                     else
-                        vcat(u0[1:(j * chunk_size)], u0dualpart,
-                             u0[(((j + 1) * chunk_size) + 1):end])
+                        vcat(
+                            u0[1:(j * chunk_size)], u0dualpart,
+                            u0[(((j + 1) * chunk_size) + 1):end]
+                        )
                     end
 
                     u0dual = ArrayInterface.restructure(u0, u0dualvec)
                 end
 
-                if p === nothing || p === DiffEqBase.NullParameters()
-                    pdual = p
+                if p === nothing || p === SciMLBase.NullParameters()
+                    pdual = tunables
                 else
-                    pdual = convert.(eltype(u0dual), p)
+                    pdual = convert.(eltype(u0dual), tunables)
                 end
 
-                if (convert_tspan(sensealg) === nothing && ((haskey(kwargs, :callback) &&
-                      has_continuous_callback(kwargs[:callback])))) ||
-                   (convert_tspan(sensealg) !== nothing && convert_tspan(sensealg))
+                if (
+                        convert_tspan(sensealg) === nothing &&
+                            (
+                            (
+                                haskey(kwargs, :callback) &&
+                                    has_continuous_callback(kwargs[:callback])
+                            )
+                        )
+                    ) ||
+                        (convert_tspan(sensealg) !== nothing && convert_tspan(sensealg))
                     tspandual = convert.(eltype(pdual), prob.tspan)
                 else
                     tspandual = prob.tspan
@@ -863,30 +1657,45 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
 
                 ## Force recompile mode because it won't handle the duals
                 ## Would require a manual tag to be applied
-                if typeof(prob.f) <: ODEFunction
-                    if prob.f.jac_prototype !== nothing
-                        _f = ODEFunction{SciMLBase.isinplace(prob.f),
-                                         SciMLBase.FullSpecialize}(unwrapped_f(prob.f),
-                                                                   jac_prototype = convert.(eltype(pdual),
-                                                                                            prob.f.jac_prototype))
-                    else
-                        _f = ODEFunction{SciMLBase.isinplace(prob.f),
-                                         SciMLBase.FullSpecialize}(unwrapped_f(prob.f))
-                    end
-                elseif typeof(prob.f) <: SDEFunction && prob.f.jac_prototype !== nothing
-                    _f = SDEFunction{SciMLBase.isinplace(prob.f), SciMLBase.FullSpecialize}(unwrapped_f(prob.f),
-                                                                                            jac_prototype = convert.(eltype(pdual),
-                                                                                                                     prob.f.jac_prototype))
+                _f = _dual_f(prob.f, eltype(pdual))
+
+                _p = if p isa SciMLBase.NullParameters
+                    p
                 else
-                    _f = prob.f
+                    SciMLStructures.replace(Tunable(), p, pdual)
                 end
 
-                _prob = remake(prob, f = _f, u0 = u0dual, p = pdual, tspan = tspandual)
+                # use the callback from kwargs, not prob
+                # When the problem carries initialization data, `u0` is a derived
+                # quantity: a single `remake(prob; u0, p)` runs initialization and
+                # recomputes `u0` from `p`, discarding the seeded duals and leaving
+                # this chunk of `du0` identically zero. Setting `p` first and `u0`
+                # second keeps the seed, because the `u0`-only `remake` is what
+                # writes it back into the parameter object (for MTK, into the
+                # `Initial(x)` parameters that initialization reads).
+                _prob = if SciMLBase.has_initialization_data(prob.f)
+                    _pprob = remake(
+                        prob, f = _f, p = _p, tspan = tspandual, callback = nothing
+                    )
+                    remake(_pprob, u0 = u0dual)
+                else
+                    remake(
+                        prob, f = _f, u0 = u0dual,
+                        p = _p,
+                        tspan = tspandual, callback = nothing
+                    )
+                end
 
                 if _prob isa SDEProblem
-                    _prob.noise_rate_prototype !== nothing && (_prob = remake(_prob,
-                                    noise_rate_prototype = convert.(eltype(pdual),
-                                                                    _prob.noise_rate_prototype)))
+                    _prob = remake(
+                        _prob;
+                        g = unwrapped_f(_prob.g),
+                        noise_rate_prototype = _prob.noise_rate_prototype === nothing ?
+                            nothing :
+                            convert.(
+                                eltype(pdual), _prob.noise_rate_prototype
+                            )
+                    )
                 end
 
                 if saveat isa Number
@@ -895,7 +1704,7 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
                     _saveat = saveat
                 end
 
-                _sol = solve(_prob, alg, args...; saveat = ts, kwargs...)
+                _sol = solve(_prob, alg, args...; saveat = ts, wrap = Val(false), kwargs...)
                 _, du = extract_local_sensitivities(_sol, sensealg, Val(true))
 
                 if haskey(kwargs, :callback)
@@ -905,37 +1714,42 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
                     # First step: filter all values, so that only time steps that actually occur
                     # in the primal are left. This is for example necessary when `terminate!`
                     # is used.
-                    indxs = findall(t -> t ∈ ts, _sol.t)
-                    _ts = _sol.t[indxs]
+                    idxs = findall(t -> t ∈ ts, current_time(_sol))
+                    _ts = current_time(_sol, idxs)
                     # after this filtering step, we might end up with a too large amount of indices.
                     # For example, if a callback saved values in the primal, then we now potentially
                     # save it by `saveat` and by `save_positions` of the callback.
                     # Second step. Drop these duplicates values.
-                    if length(indxs) != length(ts)
+                    if length(idxs) != length(ts)
                         for i in (length(_ts) - 1):-1:2
                             if _ts[i] == _ts[i + 1] && _ts[i] == _ts[i - 1]
-                                deleteat!(indxs, i)
+                                deleteat!(idxs, i)
                             end
                         end
                     end
-                    _du = @view du[indxs]
+                    _du = @view du[idxs]
                 else
                     _du = du
                 end
 
                 _du0 = sum(eachindex(_du)) do i
                     J = _du[i]
-                    if Δ isa AbstractVector || Δ isa DESolution ||
-                       Δ isa AbstractVectorOfArray
+                    if Δ isa AbstractVector
                         v = Δ[i]
+                    elseif Δ isa AbstractVectorOfArray || Δ isa Tangent
+                        v = Δ.u[i]
                     elseif Δ isa AbstractMatrix
                         v = @view Δ[:, i]
+                    elseif Δ isa Number
+                        v = fill(Δ, size(J, 1))
                     else
                         v = @view Δ[.., i]
                     end
-                    if !(Δ isa NoTangent)
+                    if !(Δ isa NoTangent || v isa ZeroTangent)
                         if u0 isa Number
                             ForwardDiff.value.(J'v)
+                        elseif v isa Tangent
+                            ForwardDiff.value.(J'vec(v.x))
                         else
                             ForwardDiff.value.(J'vec(v))
                         end
@@ -956,53 +1770,273 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractODEPro
             end
         end
 
-        if originator isa SciMLBase.TrackerOriginator ||
-           originator isa SciMLBase.ReverseDiffOriginator
-            (NoTangent(), NoTangent(), unthunk(du0), unthunk(dp), NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+        _,
+            repack_adjoint = if p === nothing || p === SciMLBase.NullParameters() ||
+                !isscimlstructure(p)
+            nothing, x -> (x,)
+        elseif isscimlstructure(p)
+            Zygote.pullback(p) do p
+                t, _, _ = canonicalize(Tunable(), p)
+                t
+            end
         else
-            (NoTangent(), NoTangent(), NoTangent(), du0, dp, NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+            nothing, x -> (x,)
+        end
+
+        dp = Zygote.accum(
+            unthunk(dp),
+            tunable_cotangent(p, solution_parameter_cotangent(Δ))
+        )
+
+        return if originator isa SciMLBase.TrackerOriginator ||
+                originator isa SciMLBase.ReverseDiffOriginator
+            (
+                NoTangent(), NoTangent(), unthunk(du0),
+                repack_adjoint(dp)[1], NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        else
+            (
+                NoTangent(), NoTangent(), NoTangent(),
+                du0, repack_adjoint(dp)[1], NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
         end
     end
-    sol, forward_sensitivity_backpass
+    return sol, forward_sensitivity_backpass
 end
 
-function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscreteProblem,
-                                                        SciMLBase.AbstractODEProblem,
-                                                        SciMLBase.AbstractDAEProblem,
-                                                        SciMLBase.AbstractDDEProblem,
-                                                        SciMLBase.AbstractSDEProblem,
-                                                        SciMLBase.AbstractSDDEProblem,
-                                                        SciMLBase.AbstractRODEProblem,
-                                                        NonlinearProblem, SteadyStateProblem
-                                                        },
-                                            alg, sensealg::ZygoteAdjoint,
-                                            u0, p, originator::SciMLBase.ADOriginator,
-                                            args...; kwargs...)
+function SciMLBase._concrete_solve_adjoint(
+        prob::Union{
+            SciMLBase.AbstractDiscreteProblem,
+            SciMLBase.AbstractODEProblem,
+            SciMLBase.AbstractDAEProblem,
+            SciMLBase.AbstractDDEProblem,
+            SciMLBase.AbstractSDEProblem,
+            SciMLBase.AbstractSDDEProblem,
+            SciMLBase.AbstractRODEProblem,
+        },
+        alg, sensealg::ZygoteAdjoint,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; kwargs...
+    )
     kwargs_filtered = NamedTuple(filter(x -> x[1] != :sensealg, kwargs))
-    Zygote.pullback((u0, p) -> solve(prob, alg, args...; u0 = u0, p = p,
-                                     sensealg = SensitivityADPassThrough(),
-                                     kwargs_filtered...), u0,
-                    p)
+    return Zygote.pullback(
+        (
+            u0,
+            p,
+        ) -> solve(
+            prob, alg, args...; u0, p,
+            sensealg = SensitivityADPassThrough(), wrap = Val(false),
+            kwargs_filtered...
+        ),
+        u0,
+        p
+    )
 end
 
-function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscreteProblem,
-                                                        SciMLBase.AbstractODEProblem,
-                                                        SciMLBase.AbstractDAEProblem,
-                                                        SciMLBase.AbstractDDEProblem,
-                                                        SciMLBase.AbstractSDEProblem,
-                                                        SciMLBase.AbstractSDDEProblem,
-                                                        SciMLBase.AbstractRODEProblem},
-                                            alg, sensealg::TrackerAdjoint,
-                                            u0, p, originator::SciMLBase.ADOriginator,
-                                            args...;
-                                            kwargs...)
+# NOTE: This is needed to prevent a method ambiguity error
+function SciMLBase._concrete_solve_adjoint(
+        prob::ConcreteNonlinearProblem, alg, sensealg::ZygoteAdjoint,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; kwargs...
+    )
+    kwargs_filtered = NamedTuple(filter(x -> x[1] != :sensealg, kwargs))
+    return Zygote.pullback(
+        (
+            u0,
+            p,
+        ) -> solve(
+            prob, alg, args...; u0, p,
+            sensealg = SensitivityADPassThrough(), wrap = Val(false),
+            kwargs_filtered...
+        ),
+        u0,
+        p
+    )
+end
+
+function SciMLBase._concrete_solve_adjoint(
+        prob::Union{
+            SciMLBase.AbstractDiscreteProblem,
+            SciMLBase.AbstractODEProblem,
+            SciMLBase.AbstractDAEProblem,
+            SciMLBase.AbstractDDEProblem,
+            SciMLBase.AbstractSDEProblem,
+            SciMLBase.AbstractSDDEProblem,
+            SciMLBase.AbstractRODEProblem,
+        },
+        alg, sensealg::EnzymeAdjoint,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; kwargs...
+    )
+    kwargs_filtered = NamedTuple(filter(x -> x[1] != :sensealg, kwargs))
+    du0 = Enzyme.make_zero(u0)
+    dp = Enzyme.make_zero(p)
+    mode = sensealg.mode
+
+    # Force no FunctionWrappers for Enzyme
+    _prob = remake(prob, f = f = ODEFunction{isinplace(prob), SciMLBase.FullSpecialize}(unwrapped_f(prob.f)))
+
+    diff_func = (
+        u0,
+        p,
+    ) -> solve(
+        _prob, alg, args...; u0, p,
+        sensealg = SensitivityADPassThrough(), wrap = Val(false),
+        kwargs_filtered...
+    )
+
+    splitmode = if mode isa Enzyme.ForwardMode
+        error("EnzymeAdjoint currently only allows mode=Reverse. File an issue if this is necessary.")
+    elseif mode === nothing || mode isa Enzyme.ReverseMode
+        Enzyme.set_runtime_activity(Enzyme.ReverseSplitWithPrimal)
+    end
+
+    forward,
+        reverse = Enzyme.autodiff_thunk(
+        splitmode, Enzyme.Const{typeof(diff_func)}, Enzyme.Duplicated,
+        Enzyme.Duplicated{typeof(u0)}, Enzyme.Duplicated{typeof(p)}
+    )
+    tape, result,
+        shadow_result = forward(
+        Enzyme.Const(diff_func), Enzyme.Duplicated(copy(u0), du0), Enzyme.Duplicated(copy(p), dp)
+    )
+
+    function enzyme_sensitivity_backpass(Δ)
+        # Zygote/ChainRules can hand back a thunked cotangent (e.g. an
+        # `InplaceableThunk`); materialize it so the VectorOfArray/array handling
+        # below applies instead of hitting the unsupported-type `error`.
+        Δ = Δ isa AbstractThunk ? unthunk(Δ) : Δ
+        if (Δ isa AbstractArray{<:AbstractArray} || Δ isa AbstractVectorOfArray)
+            for (x, y) in zip(shadow_result.u, Δ.u)
+                x .= y
+            end
+        else
+            error("typeof(Δ) = $(typeof(Δ)) is not currently handled in EnzymeAdjoint. Please open an issue with an MWE to add support")
+        end
+        reverse(Enzyme.Const(diff_func), Enzyme.Duplicated(u0, du0), Enzyme.Duplicated(p, dp), tape)
+        return if originator isa SciMLBase.TrackerOriginator ||
+                originator isa SciMLBase.ReverseDiffOriginator
+            (
+                NoTangent(), NoTangent(), du0, dp, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        else
+            (
+                NoTangent(), NoTangent(), NoTangent(), du0, dp, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        end
+    end
+    return result, enzyme_sensitivity_backpass
+end
+
+# NOTE: This is needed to prevent a method ambiguity error
+function SciMLBase._concrete_solve_adjoint(
+        prob::ConcreteNonlinearProblem, alg, sensealg::EnzymeAdjoint,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; kwargs...
+    )
+    kwargs_filtered = NamedTuple(filter(x -> x[1] != :sensealg, kwargs))
+
+    du0 = make_zero(u0)
+    dp = make_zero(p)
+    mode = sensealg.mode
+
+    f = (
+        u0,
+        p,
+    ) -> solve(
+        prob, alg, args...; u0, p,
+        sensealg = SensitivityADPassThrough(), wrap = Val(false),
+        kwargs_filtered...
+    )
+
+    splitmode = if mode isa Forward
+        error("EnzymeAdjoint currently only allows mode=Reverse. File an issue if this is necessary.")
+    elseif mode === nothing || mode === Reverse
+        ReverseSplitWithPrimal
+    end
+
+    forward,
+        reverse = autodiff_thunk(
+        splitmode, Const{typeof(f)}, Duplicated,
+        Duplicated{typeof(u0)}, Duplicated{typeof(p)}
+    )
+    tape, result, shadow_result = forward(Const(f), Duplicated(u0, du0), Duplicated(p, dp))
+
+    function enzyme_sensitivity_backpass(Δ)
+        reverse(Const(f), Duplicated(u0, du0), Duplicated(p, dp), Δ, tape)
+        return if originator isa SciMLBase.TrackerOriginator ||
+                originator isa SciMLBase.ReverseDiffOriginator
+            (
+                NoTangent(), NoTangent(), du0, dp, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        else
+            (
+                NoTangent(), NoTangent(), NoTangent(), du0, dp, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        end
+    end
+    return sol, enzyme_sensitivity_backpass
+end
+
+const ENZYME_TRACKED_REAL_ERROR_MESSAGE = """
+`Enzyme` is not compatible with `ReverseDiffAdjoint` nor with `TrackerAdjoint`.
+Either choose a different adjoint method like `GaussAdjoint`,
+or use a different AD system like `ReverseDiff`.
+For more details, on these methods see
+https://docs.sciml.ai/SciMLSensitivity/stable/.
+"""
+
+struct EnzymeTrackedRealError <: Exception
+end
+
+function Base.showerror(io::IO, e::EnzymeTrackedRealError)
+    return println(io, ENZYME_TRACKED_REAL_ERROR_MESSAGE)
+end
+
+function SciMLBase._concrete_solve_adjoint(
+        prob::Union{
+            SciMLBase.AbstractDiscreteProblem,
+            SciMLBase.AbstractODEProblem,
+            SciMLBase.AbstractDAEProblem,
+            SciMLBase.AbstractDDEProblem,
+            SciMLBase.AbstractSDEProblem,
+            SciMLBase.AbstractSDDEProblem,
+            SciMLBase.AbstractRODEProblem,
+        },
+        alg, sensealg::TrackerAdjoint,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...;
+        kwargs...
+    )
     local sol
+    if originator isa SciMLBase.EnzymeOriginator
+        throw(EnzymeTrackedRealError())
+    end
+
+    if !(p === nothing || p isa SciMLBase.NullParameters)
+        if !isscimlstructure(p)
+            throw(SciMLStructuresCompatibilityError())
+        end
+    end
+
+    if p === nothing || p isa SciMLBase.NullParameters
+        tunables, repack = p, identity
+    else
+        tunables, repack, _ = canonicalize(Tunable(), p)
+    end
+
     function tracker_adjoint_forwardpass(_u0, _p)
-        if (convert_tspan(sensealg) === nothing &&
-            ((haskey(kwargs, :callback) && has_continuous_callback(kwargs[:callback])))) ||
-           (convert_tspan(sensealg) !== nothing && convert_tspan(sensealg))
+        if (
+                convert_tspan(sensealg) === nothing &&
+                    ((haskey(kwargs, :callback) && has_continuous_callback(kwargs[:callback])))
+            ) ||
+                (convert_tspan(sensealg) !== nothing && convert_tspan(sensealg))
             _tspan = convert.(eltype(_p), prob.tspan)
         else
             _tspan = prob.tspan
@@ -1014,18 +2048,28 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscre
 
             ## Force recompile mode because it's required for the tracked type handling
             if prob.f isa ODEFunction &&
-               (prob.f.f isa FunctionWrappersWrappers.FunctionWrappersWrapper ||
-                SciMLBase.specialization(prob.f) === SciMLBase.AutoSpecialize)
+                    (
+                    prob.f.f isa FunctionWrappersWrappers.FunctionWrappersWrapper ||
+                        SciMLBase.specialization(prob.f) === SciMLBase.AutoSpecialize
+                )
                 f = ODEFunction{isinplace(prob), SciMLBase.FullSpecialize}(unwrapped_f(prob.f))
-                _prob = remake(prob, f = f, u0 = map(identity, _u0), p = _p, tspan = _tspan)
+                _prob = remake(
+                    prob; f, u0 = map(identity, _u0),
+                    p = _p, tspan = _tspan, callback = nothing
+                )
             else
-                _prob = remake(prob, u0 = map(identity, _u0), p = _p, tspan = _tspan)
+                _prob = remake(
+                    prob, u0 = map(identity, _u0), p = _p,
+                    tspan = _tspan, callback = nothing
+                )
             end
         else
             # use TrackedArray for efficiency of the tape
-            if typeof(prob) <:
-               Union{SciMLBase.AbstractDDEProblem, SciMLBase.AbstractDAEProblem,
-                     SciMLBase.AbstractSDDEProblem}
+            if prob isa
+                    Union{
+                    SciMLBase.AbstractDDEProblem, SciMLBase.AbstractDAEProblem,
+                    SciMLBase.AbstractSDDEProblem,
+                }
                 _f = function (u, p, h, t) # For DDE, but also works for (du,u,p,t) DAE
                     out = prob.f(u, p, h, t)
                     if out isa TrackedArray
@@ -1036,7 +2080,7 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscre
                 end
 
                 # Only define `g` for the stochastic ones
-                if typeof(prob) <: SciMLBase.AbstractSDEProblem
+                if prob isa SciMLBase.AbstractSDEProblem
                     _g = function (u, p, h, t)
                         out = prob.g(u, p, h, t)
                         if out isa TrackedArray
@@ -1045,21 +2089,32 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscre
                             Tracker.collect(out)
                         end
                     end
-                    _prob = remake(prob,
-                                   f = DiffEqBase.parameterless_type(prob.f){false,
-                                                                             SciMLBase.FullSpecialize
-                                                                             }(_f,
-                                                                               _g),
-                                   u0 = _u0, p = _p, tspan = _tspan)
+                    _prob = remake(
+                        prob,
+                        f = ArrayInterface.parameterless_type(prob.f){
+                            false,
+                            SciMLBase.FullSpecialize,
+                        }(
+                            _f,
+                            _g
+                        ),
+                        g = _g,
+                        u0 = _u0, p = SciMLStructures.replace(Tunable(), p, _p),
+                        tspan = _tspan, callback = nothing
+                    )
                 else
-                    _prob = remake(prob,
-                                   f = DiffEqBase.parameterless_type(prob.f){false,
-                                                                             SciMLBase.FullSpecialize
-                                                                             }(_f),
-                                   u0 = _u0, p = _p, tspan = _tspan)
+                    _prob = remake(
+                        prob,
+                        f = ArrayInterface.parameterless_type(prob.f){
+                            false,
+                            SciMLBase.FullSpecialize,
+                        }(_f),
+                        u0 = _u0, p = SciMLStructures.replace(Tunable(), p, _p),
+                        tspan = _tspan, callback = nothing
+                    )
                 end
-            elseif typeof(prob) <:
-                   Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractSDEProblem}
+            elseif prob isa
+                    Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractSDEProblem}
                 _f = function (u, p, t)
                     out = prob.f(u, p, t)
                     if out isa TrackedArray
@@ -1068,7 +2123,7 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscre
                         Tracker.collect(out)
                     end
                 end
-                if typeof(prob) <: SciMLBase.AbstractSDEProblem
+                if prob isa SciMLBase.AbstractSDEProblem
                     _g = function (u, p, t)
                         out = prob.g(u, p, t)
                         if out isa TrackedArray
@@ -1077,18 +2132,29 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscre
                             Tracker.collect(out)
                         end
                     end
-                    _prob = remake(prob,
-                                   f = DiffEqBase.parameterless_type(prob.f){false,
-                                                                             SciMLBase.FullSpecialize
-                                                                             }(_f,
-                                                                               _g),
-                                   u0 = _u0, p = _p, tspan = _tspan)
+                    _prob = remake(
+                        prob,
+                        f = ArrayInterface.parameterless_type(prob.f){
+                            false,
+                            SciMLBase.FullSpecialize,
+                        }(
+                            _f,
+                            _g
+                        ),
+                        g = _g,
+                        u0 = _u0, p = SciMLStructures.replace(Tunable(), p, _p),
+                        tspan = _tspan, callback = nothing
+                    )
                 else
-                    _prob = remake(prob,
-                                   f = DiffEqBase.parameterless_type(prob.f){false,
-                                                                             SciMLBase.FullSpecialize
-                                                                             }(_f),
-                                   u0 = _u0, p = _p, tspan = _tspan)
+                    _prob = remake(
+                        prob,
+                        f = ArrayInterface.parameterless_type(prob.f){
+                            false,
+                            SciMLBase.FullSpecialize,
+                        }(_f),
+                        u0 = _u0, p = SciMLStructures.replace(Tunable(), p, _p),
+                        tspan = _tspan, callback = nothing
+                    )
                 end
             else
                 error("TrackerAdjont does not currently support the specified problem type. Please open an issue.")
@@ -1096,29 +2162,46 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscre
         end
 
         kwargs_filtered = NamedTuple(filter(x -> x[1] != :sensealg, kwargs))
-        sol = solve(_prob, alg, args...; sensealg = DiffEqBase.SensitivityADPassThrough(),
-                    kwargs_filtered...)
+        sol = solve(
+            _prob, alg, args...; sensealg = DiffEqBase.SensitivityADPassThrough(),
+            wrap = Val(false), kwargs_filtered...
+        )
+        sol = SciMLBase.sensitivity_solution(sol, state_values(sol), current_time(sol))
+        @reset sol.prob = prob
 
-        if typeof(sol.u[1]) <: Array
+        if state_values(sol, 1) isa Array
             return Array(sol)
         else
-            tmp = vec(sol.u[1])
+            tmp = vec(state_values(sol, 1))
             for i in 2:length(sol.u)
-                tmp = hcat(tmp, vec(sol.u[i]))
+                tmp = hcat(tmp, vec(state_values(sol, i)))
             end
-            return reshape(tmp, size(sol.u[1])..., length(sol.u))
+            return reshape(tmp, size(sol))
         end
         #adapt(typeof(u0),arr)
-        sol
+        return sol
     end
 
-    out, pullback = Tracker.forward(tracker_adjoint_forwardpass, u0, p)
+    out, pullback = Tracker.forward(tracker_adjoint_forwardpass, u0, tunables)
     function tracker_adjoint_backpass(ybar)
-        tmp = if eltype(ybar) <: Number && typeof(u0) <: Array
-            Array(ybar)
+        ybar = ybar isa AbstractThunk ? unthunk(ybar) : ybar
+        tmp = if ybar isa AbstractDiffEqArray
+            if state_values(ybar, 1) isa Array
+                Array(ybar)
+            else
+                reshape(reduce(hcat, vec.(state_values(ybar))), size(ybar))
+            end
+        elseif eltype(ybar) <: Number && u0 isa Array
+            Array(ybar) # can also be a ODESolution
         elseif eltype(ybar) <: Number # CuArray{Floats}
             ybar
-        elseif typeof(ybar[1]) <: Array
+        elseif ybar isa Tangent
+            ut = unthunk.(ybar.u)
+            ut_ = map(ut) do u
+                (u isa ZeroTangent || u isa NoTangent) ? zero(u0) : u
+            end
+            reduce(hcat, ut_)
+        elseif ybar.u[1] isa Array
             return Array(ybar)
         else
             tmp = vec(ybar.u[1])
@@ -1130,45 +2213,115 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscre
         u0bar, pbar = pullback(tmp)
         _u0bar = u0bar isa Tracker.TrackedArray ? Tracker.data(u0bar) : Tracker.data.(u0bar)
 
-        if originator isa SciMLBase.TrackerOriginator ||
-           originator isa SciMLBase.ReverseDiffOriginator
-            (NoTangent(), NoTangent(), _u0bar, Tracker.data(pbar), NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+        return if originator isa SciMLBase.TrackerOriginator ||
+                originator isa SciMLBase.ReverseDiffOriginator
+            (
+                NoTangent(), NoTangent(), _u0bar, Tracker.data(pbar), NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
         else
-            (NoTangent(), NoTangent(), NoTangent(), _u0bar, Tracker.data(pbar), NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+            (
+                NoTangent(), NoTangent(), NoTangent(),
+                _u0bar, Tracker.data(pbar), NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
         end
     end
 
-    u = u0 isa Tracker.TrackedArray ? Tracker.data.(sol.u) :
-        Tracker.data.(Tracker.data.(sol.u))
-    DiffEqBase.sensitivity_solution(sol, u, Tracker.data.(sol.t)), tracker_adjoint_backpass
+    u = u0 isa Tracker.TrackedArray ? Tracker.data.(state_values(sol)) :
+        Tracker.data.(Tracker.data.(state_values(sol)))
+    return SciMLBase.sensitivity_solution(sol, u, Tracker.data.(current_time(sol))),
+        tracker_adjoint_backpass
 end
 
-const REVERSEDIFF_ADJOINT_GPU_COMPATABILITY_MESSAGE = """
-                                                      ReverseDiffAdjoint is not compatible GPU-based array types. Use a different
-                                                      sensitivity analysis method, like InterpolatingAdjoint or TrackerAdjoint,
-                                                      in order to combine with GPUs.
-                                                      """
+# Mooncake-specific `TrackerAdjoint` path. Same reasoning as the
+# `ReverseDiffAdjoint` + `MooncakeOriginator` method below: the main method
+# returns `sensitivity_solution(tracked_sol, …)` with `Tracker.TrackedReal` /
+# `TrackedArray` type parameters embedded in `tracked_sol.interp` / `.prob`
+# / `.alg`, and Mooncake's `@from_rrule` plumbing chokes when recursively
+# computing `tangent_type` on those fields. Delegate the tape to the
+# `ChainRulesOriginator` path and re-solve with `SensitivityADPassThrough`
+# for the primal.
+function SciMLBase._concrete_solve_adjoint(
+        prob::Union{
+            SciMLBase.AbstractDiscreteProblem,
+            SciMLBase.AbstractODEProblem,
+            SciMLBase.AbstractDAEProblem,
+            SciMLBase.AbstractDDEProblem,
+            SciMLBase.AbstractSDEProblem,
+            SciMLBase.AbstractSDDEProblem,
+            SciMLBase.AbstractRODEProblem,
+        },
+        alg, sensealg::TrackerAdjoint,
+        u0, p, originator::SciMLBase.MooncakeOriginator,
+        args...; kwargs...
+    )
+    _, backpass = SciMLBase._concrete_solve_adjoint(
+        prob, alg, sensealg, u0, p,
+        SciMLBase.ChainRulesOriginator(), args...; kwargs...
+    )
+    kwargs_filtered = NamedTuple(filter(x -> x[1] != :sensealg, kwargs))
+    primal = solve(
+        remake(prob; u0, p), alg, args...;
+        sensealg = DiffEqBase.SensitivityADPassThrough(), wrap = Val(false),
+        kwargs_filtered...
+    )
+    return primal, backpass
+end
+
+const REVERSEDIFF_ADJOINT_GPU_COMPATIBILITY_MESSAGE = """
+ReverseDiffAdjoint is not compatible GPU-based array types. Use a different
+sensitivity analysis method, like InterpolatingAdjoint or TrackerAdjoint,
+in order to combine with GPUs.
+"""
 
 struct ReverseDiffGPUStateCompatibilityError <: Exception end
 
 function Base.showerror(io::IO, e::ReverseDiffGPUStateCompatibilityError)
-    print(io, FORWARDDIFF_SENSITIVITY_PARAMETER_COMPATABILITY_MESSAGE)
+    return print(io, FORWARDDIFF_SENSITIVITY_PARAMETER_COMPATIBILITY_MESSAGE)
 end
 
-function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscreteProblem,
-                                                        SciMLBase.AbstractODEProblem,
-                                                        SciMLBase.AbstractDAEProblem,
-                                                        SciMLBase.AbstractDDEProblem,
-                                                        SciMLBase.AbstractSDEProblem,
-                                                        SciMLBase.AbstractSDDEProblem,
-                                                        SciMLBase.AbstractRODEProblem},
-                                            alg, sensealg::ReverseDiffAdjoint,
-                                            u0, p, originator::SciMLBase.ADOriginator,
-                                            args...; kwargs...)
+const SCIMLSTRUCTURES_ERROR_MESSAGE = """
+`p` is not a SciMLStructure. This is required for adjoint sensitivity analysis. For more information,
+see the documentation on SciMLStructures.jl for the definition of the SciMLStructures interface.
+In particular, adjoint sensitivities only applies to `Tunable`.
+
+Alternatively, if your parameter type is a Functors.jl functor (i.e., has `Functors.@functor`
+defined), you can use it directly with `GaussAdjoint` or `GaussKronrodAdjoint` (with
+`ZygoteVJP`). The functor portion should contain only the tunable parameters.
+"""
+
+struct SciMLStructuresCompatibilityError <: Exception
+end
+
+function Base.showerror(io::IO, e::SciMLStructuresCompatibilityError)
+    return println(io, SCIMLSTRUCTURES_ERROR_MESSAGE)
+end
+
+function SciMLBase._concrete_solve_adjoint(
+        prob::Union{
+            SciMLBase.AbstractDiscreteProblem,
+            SciMLBase.AbstractODEProblem,
+            SciMLBase.AbstractDAEProblem,
+            SciMLBase.AbstractDDEProblem,
+            SciMLBase.AbstractSDEProblem,
+            SciMLBase.AbstractSDDEProblem,
+            SciMLBase.AbstractRODEProblem,
+        },
+        alg, sensealg::ReverseDiffAdjoint,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; kwargs...
+    )
     if typeof(u0) isa GPUArraysCore.AbstractGPUArray
         throw(ReverseDiffGPUStateCompatibilityError())
+    end
+
+    if !(u0 isa AbstractVector)
+        error("Sensitivity algorithm ReverseDiffAdjoint only supports vector u0")
+    end
+
+    if originator isa SciMLBase.EnzymeOriginator
+        throw(EnzymeTrackedRealError())
     end
 
     t = eltype(prob.tspan)[]
@@ -1177,9 +2330,11 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscre
     local sol
 
     function reversediff_adjoint_forwardpass(_u0, _p)
-        if (convert_tspan(sensealg) === nothing &&
-            ((haskey(kwargs, :callback) && has_continuous_callback(kwargs[:callback])))) ||
-           (convert_tspan(sensealg) !== nothing && convert_tspan(sensealg))
+        if (
+                convert_tspan(sensealg) === nothing &&
+                    ((haskey(kwargs, :callback) && has_continuous_callback(kwargs[:callback])))
+            ) ||
+                (convert_tspan(sensealg) !== nothing && convert_tspan(sensealg))
             _tspan = convert.(eltype(_p), prob.tspan)
         else
             _tspan = prob.tspan
@@ -1191,91 +2346,186 @@ function DiffEqBase._concrete_solve_adjoint(prob::Union{SciMLBase.AbstractDiscre
 
             ## Force recompile mode because it's required for the tracked type handling
             if prob.f isa ODEFunction &&
-               (prob.f.f isa FunctionWrappersWrappers.FunctionWrappersWrapper ||
-                SciMLBase.specialization(prob.f) === SciMLBase.AutoSpecialize)
+                    (
+                    prob.f.f isa FunctionWrappersWrappers.FunctionWrappersWrapper ||
+                        SciMLBase.specialization(prob.f) === SciMLBase.AutoSpecialize
+                )
                 f = ODEFunction{isinplace(prob), SciMLBase.FullSpecialize}(unwrapped_f(prob.f))
-                _prob = remake(prob, f = f, u0 = reshape([x for x in _u0], size(_u0)),
-                               p = _p,
-                               tspan = _tspan)
+                _prob = remake(
+                    prob; f, u0 = reshape([x for x in _u0], size(_u0)),
+                    p = _p,
+                    tspan = _tspan,
+                    callback = nothing
+                )
             else
-                _prob = remake(prob, u0 = reshape([x for x in _u0], size(_u0)), p = _p,
-                               tspan = _tspan)
+                _prob = remake(
+                    prob, u0 = reshape([x for x in _u0], size(_u0)), p = _p,
+                    tspan = _tspan
+                )
             end
         else
             # use TrackedArray for efficiency of the tape
-            _f(args...) = reduce(vcat, prob.f(args...))
+            _f(args...) = ArrayInterface.aos_to_soa(prob.f(args...))
             if prob isa SDEProblem
-                _g(args...) = reduce(vcat, prob.g(args...))
-                _prob = remake(prob,
-                               f = DiffEqBase.parameterless_type(prob.f){
-                                                                         SciMLBase.isinplace(prob),
-                                                                         true}(_f, _g),
-                               u0 = _u0, p = _p, tspan = _tspan)
+                _g(args...) = ArrayInterface.aos_to_soa(prob.g(args...))
+                _prob = remake(
+                    prob,
+                    f = ArrayInterface.parameterless_type(prob.f){
+                        SciMLBase.isinplace(prob),
+                        true,
+                    }(
+                        _f,
+                        _g
+                    ),
+                    u0 = _u0, p = _p, tspan = _tspan, callback = nothing
+                )
             else
-                _prob = remake(prob,
-                               f = DiffEqBase.parameterless_type(prob.f){
-                                                                         SciMLBase.isinplace(prob),
-                                                                         true}(_f),
-                               u0 = _u0, p = _p, tspan = _tspan)
+                _prob = remake(
+                    prob,
+                    f = ArrayInterface.parameterless_type(prob.f){
+                        SciMLBase.isinplace(prob),
+                        true,
+                    }(_f),
+                    u0 = _u0, p = _p, tspan = _tspan, callback = nothing
+                )
             end
         end
 
         kwargs_filtered = NamedTuple(filter(x -> x[1] != :sensealg, kwargs))
-        sol = solve(_prob, alg, args...; sensealg = DiffEqBase.SensitivityADPassThrough(),
-                    kwargs_filtered...)
-        t = sol.t
+        sol = solve(
+            _prob, alg, args...; sensealg = DiffEqBase.SensitivityADPassThrough(),
+            wrap = Val(false), kwargs_filtered...
+        )
+        t = current_time(sol)
         if DiffEqBase.isinplace(prob)
-            u = map.(ReverseDiff.value, sol.u)
+            u = map.(ReverseDiff.value, state_values(sol))
         else
-            u = map(ReverseDiff.value, sol.u)
+            u = map(ReverseDiff.value, state_values(sol))
         end
-        Array(sol)
+        sol = SciMLBase.sensitivity_solution(sol, state_values(sol), t)
+        return Array(sol)
     end
 
     tape = ReverseDiff.GradientTape(reversediff_adjoint_forwardpass, (u0, p))
     tu, tp = ReverseDiff.input_hook(tape)
     output = ReverseDiff.output_hook(tape)
     ReverseDiff.value!(tu, u0)
-    typeof(p) <: DiffEqBase.NullParameters || ReverseDiff.value!(tp, p)
+    p isa SciMLBase.NullParameters || ReverseDiff.value!(tp, p)
     ReverseDiff.forward_pass!(tape)
+
     function reversediff_adjoint_backpass(ybar)
-        _ybar = if ybar isa VectorOfArray
+        ybar = ybar isa AbstractThunk ? unthunk(ybar) : ybar
+        _ybar = if ybar isa AbstractVectorOfArray
             Array(ybar)
         elseif eltype(ybar) <: AbstractArray
             Array(VectorOfArray(ybar))
+        elseif ybar isa Tangent
+            yy = map(unthunk.(ybar.u)) do u
+                (u isa ZeroTangent || u isa NoTangent) ? zero(u0) : u
+            end
+            Array(VectorOfArray(yy))
         else
             ybar
         end
         ReverseDiff.increment_deriv!(output, _ybar)
         ReverseDiff.reverse_pass!(tape)
 
-        if originator isa SciMLBase.TrackerOriginator ||
-           originator isa SciMLBase.ReverseDiffOriginator
-            (NoTangent(), NoTangent(), ReverseDiff.deriv(tu), ReverseDiff.deriv(tp),
-             NoTangent(), ntuple(_ -> NoTangent(), length(args))...)
+        return if originator isa SciMLBase.TrackerOriginator ||
+                originator isa SciMLBase.ReverseDiffOriginator
+            (
+                NoTangent(), NoTangent(), ReverseDiff.deriv(tu), ReverseDiff.deriv(tp),
+                NoTangent(), ntuple(_ -> NoTangent(), length(args))...,
+            )
         else
-            (NoTangent(), NoTangent(), NoTangent(), ReverseDiff.deriv(tu),
-             ReverseDiff.deriv(tp), NoTangent(), ntuple(_ -> NoTangent(), length(args))...)
+            (
+                NoTangent(), NoTangent(), NoTangent(), ReverseDiff.deriv(tu),
+                ReverseDiff.deriv(tp), NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
         end
     end
-    Array(VectorOfArray(u)), reversediff_adjoint_backpass
+    u = u0 isa ReverseDiff.TrackedArray ? ReverseDiff.value(state_values(sol)) :
+        ReverseDiff.value.(state_values(sol))
+    return SciMLBase.sensitivity_solution(sol, u, ReverseDiff.value.(current_time(sol))),
+        reversediff_adjoint_backpass
 end
 
-function DiffEqBase._concrete_solve_adjoint(prob::SciMLBase.AbstractODEProblem, alg,
-                                            sensealg::AbstractShadowingSensitivityAlgorithm,
-                                            u0, p, originator::SciMLBase.ADOriginator,
-                                            args...; save_start = true, save_end = true,
-                                            saveat = eltype(prob.tspan)[],
-                                            save_idxs = nothing,
-                                            kwargs...)
-    if haskey(kwargs, :callback)
+# Mooncake-specific `ReverseDiffAdjoint` path. The main `ReverseDiffAdjoint`
+# method above returns `SciMLBase.sensitivity_solution(sol, …)` where `sol`
+# still carries `ReverseDiff.TrackedReal` / `TrackedArray` type parameters in
+# nested fields (`interp`, `prob`, `alg`, …). ChainRules / Zygote don't
+# inspect the primal's type parameters, so they don't care. Mooncake's
+# `@from_rrule` plumbing, on the other hand, calls
+# `zero_tangent(y_primal)` and therefore recursively computes `tangent_type`
+# for every nested field of the returned solution; that recursion fails on
+# the tracked type parameters with either a `TypeError` or an unhelpful
+# tangent-type error, which is what the `hybrid_diffeq` tutorial and
+# PR #1419 ran into.
+#
+# This method delegates the tape construction (and hence the whole backward
+# pass) to the `ChainRulesOriginator` path, then replaces the primal with
+# a fresh plain-arithmetic solve of the same problem. The obvious
+# alternative — walking the returned primal and stripping tracked scalars
+# via `SciMLBase.value` recursively — *almost* works but fails on one
+# specific slot: `solve()` wraps `prob.f` in a
+# `FunctionWrappersWrappers.FunctionWrappersWrapper` during
+# `get_concrete_problem`, and the resulting `FunctionWrapper` has no
+# public positional constructor for `ConstructionBase.setproperties`, so a
+# generic walker can't rebuild it. Mooncake's `@from_rrule` type
+# inference nonetheless expects the `FunctionWrapper` version (because
+# that's what `solve()` normally returns from a plain-arithmetic solve),
+# so anything short of actually invoking `solve()` produces a type
+# mismatch on the `DerivedRule` assertion. A truly general
+# `strip_values(sol)` in SciMLBase would need the same `solve()`
+# round-trip internally, so the cost is unavoidable here.
+#
+# Keeping this in a dedicated method dispatched on `MooncakeOriginator`
+# stops Julia type inference from joining two different return shapes
+# into a `Union{ODESolution{tracked…}, ODESolution{plain…}}`, which would
+# otherwise trip Mooncake's `DerivedRule` type assertion.
+function SciMLBase._concrete_solve_adjoint(
+        prob::Union{
+            SciMLBase.AbstractDiscreteProblem,
+            SciMLBase.AbstractODEProblem,
+            SciMLBase.AbstractDAEProblem,
+            SciMLBase.AbstractDDEProblem,
+            SciMLBase.AbstractSDEProblem,
+            SciMLBase.AbstractSDDEProblem,
+            SciMLBase.AbstractRODEProblem,
+        },
+        alg, sensealg::ReverseDiffAdjoint,
+        u0, p, originator::SciMLBase.MooncakeOriginator,
+        args...; kwargs...
+    )
+    _, backpass = SciMLBase._concrete_solve_adjoint(
+        prob, alg, sensealg, u0, p,
+        SciMLBase.ChainRulesOriginator(), args...; kwargs...
+    )
+    kwargs_filtered = NamedTuple(filter(x -> x[1] != :sensealg, kwargs))
+    primal = solve(
+        remake(prob; u0, p), alg, args...;
+        sensealg = DiffEqBase.SensitivityADPassThrough(), wrap = Val(false),
+        kwargs_filtered...
+    )
+    return primal, backpass
+end
+
+function SciMLBase._concrete_solve_adjoint(
+        prob::SciMLBase.AbstractODEProblem, alg,
+        sensealg::AbstractShadowingSensitivityAlgorithm,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; save_start = true, save_end = true,
+        saveat = eltype(prob.tspan)[],
+        save_idxs = nothing,
+        kwargs...
+    )
+    if _has_effective_callback(get(kwargs, :callback, nothing))
         error("Sensitivity analysis based on Least Squares Shadowing is not compatible with callbacks. Please select another `sensealg`.")
     else
-        _prob = remake(prob, f = unwrapped_f(prob.f), u0 = u0, p = p)
+        _prob = remake(prob; f = unwrapped_f(prob.f), u0, p)
     end
 
-    sol = solve(_prob, alg, args...; save_start = save_start, save_end = save_end,
-                saveat = saveat, kwargs...)
+    sol = solve(_prob, alg, args...; save_start, save_end, saveat, wrap = Val(false), kwargs...)
 
     if saveat isa Number
         if _prob.tspan[2] > _prob.tspan[1]
@@ -1285,11 +2535,12 @@ function DiffEqBase._concrete_solve_adjoint(prob::SciMLBase.AbstractODEProblem, 
         end
         _out = sol(ts)
         out = if save_idxs === nothing
-            out = DiffEqBase.sensitivity_solution(sol, _out.u, sol.t)
+            out = SciMLBase.sensitivity_solution(
+                sol, state_values(_out), current_time(sol)
+            )
         else
-            out = DiffEqBase.sensitivity_solution(sol,
-                                                  [_out[i][save_idxs]
-                                                   for i in 1:length(_out)], ts)
+            outuf = getu(_out, save_idxs)
+            out = SciMLBase.sensitivity_solution(sol, outuf(_out, 1:length(_out.u)), ts)
         end
         # only_end
         (length(ts) == 1 && ts[1] == _prob.tspan[2]) &&
@@ -1297,25 +2548,24 @@ function DiffEqBase._concrete_solve_adjoint(prob::SciMLBase.AbstractODEProblem, 
     elseif isempty(saveat)
         no_start = !save_start
         no_end = !save_end
-        sol_idxs = 1:length(sol)
+        sol_idxs = 1:length(sol.u)
         no_start && (sol_idxs = sol_idxs[2:end])
         no_end && (sol_idxs = sol_idxs[1:(end - 1)])
         only_end = length(sol_idxs) <= 1
-        _u = sol.u[sol_idxs]
+        _u = state_values(sol, sol_idxs)
         u = save_idxs === nothing ? _u : [x[save_idxs] for x in _u]
-        ts = sol.t[sol_idxs]
-        out = DiffEqBase.sensitivity_solution(sol, u, ts)
+        ts = current_time(sol, sol_idxs)
+        out = SciMLBase.sensitivity_solution(sol, u, ts)
     else
         _saveat = saveat isa Array ? sort(saveat) : saveat # for minibatching
         ts = _saveat
         _out = sol(ts)
 
         out = if save_idxs === nothing
-            out = DiffEqBase.sensitivity_solution(sol, _out.u, ts)
+            out = SciMLBase.sensitivity_solution(sol, state_values(_out), ts)
         else
-            out = DiffEqBase.sensitivity_solution(sol,
-                                                  [_out[i][save_idxs]
-                                                   for i in 1:length(_out)], ts)
+            outuf = getu(_out, save_idxs)
+            out = SciMLBase.sensitivity_solution(sol, outuf(_out, 1:length(_out.u)), ts)
         end
         # only_end
         (length(ts) == 1 && ts[1] == _prob.tspan[2]) &&
@@ -1326,28 +2576,51 @@ function DiffEqBase._concrete_solve_adjoint(prob::SciMLBase.AbstractODEProblem, 
 
     function adjoint_sensitivity_backpass(Δ)
         function df(_out, u, p, t, i)
-            if typeof(Δ) <: AbstractArray{<:AbstractArray} || typeof(Δ) <: DESolution
-                if typeof(_save_idxs) <: Number
-                    _out[_save_idxs] = Δ[i][_save_idxs]
+            return if Δ isa AbstractArray{<:AbstractArray} || Δ isa AbstractVectorOfArray ||
+                    (
+                    Δ isa AbstractTangent &&
+                        (Δ.u isa AbstractArray{<:AbstractArray} || Δ.u isa AbstractVectorOfArray)
+                )
+                x = (Δ isa AbstractVectorOfArray || Δ isa AbstractTangent) ?
+                    unthunk(Δ.u[i]) : Δ[i]
+                if _save_idxs isa Number
+                    _out[_save_idxs] = x[_save_idxs]
                 elseif _save_idxs isa Colon
-                    vec(_out) .= vec(Δ[i])
+                    vec(_out) .= vec(x)
                 else
-                    vec(@view(_out[_save_idxs])) .= vec(Δ[i][_save_idxs])
+                    vec(@view(_out[_save_idxs])) .= vec(x[_save_idxs])
                 end
             else
-                if typeof(_save_idxs) <: Number
-                    _out[_save_idxs] = adapt(DiffEqBase.parameterless_type(u0),
-                                             reshape(Δ, prod(size(Δ)[1:(end - 1)]),
-                                                     size(Δ)[end])[_save_idxs, i])
+                Δu = Δ isa AbstractTangent ? Δ.u : Δ
+                if _save_idxs isa Number
+                    _out[_save_idxs] = adapt(
+                        ArrayInterface.parameterless_type(u0),
+                        reshape(
+                            Δu, prod(size(Δu)[1:(end - 1)]),
+                            size(Δu)[end]
+                        )[_save_idxs, i]
+                    )
                 elseif _save_idxs isa Colon
-                    vec(_out) .= vec(adapt(DiffEqBase.parameterless_type(u0),
-                                           reshape(Δ, prod(size(Δ)[1:(end - 1)]),
-                                                   size(Δ)[end])[:, i]))
+                    vec(_out) .= vec(
+                        adapt(
+                            ArrayInterface.parameterless_type(u0),
+                            reshape(
+                                Δu, prod(size(Δu)[1:(end - 1)]),
+                                size(Δu)[end]
+                            )[:, i]
+                        )
+                    )
                 else
-                    vec(@view(_out[_save_idxs])) .= vec(adapt(DiffEqBase.parameterless_type(u0),
-                                                              reshape(Δ,
-                                                                      prod(size(Δ)[1:(end - 1)]),
-                                                                      size(Δ)[end])[:, i]))
+                    vec(@view(_out[_save_idxs])) .= vec(
+                        adapt(
+                            ArrayInterface.parameterless_type(u0),
+                            reshape(
+                                Δu,
+                                prod(size(Δu)[1:(end - 1)]),
+                                size(Δu)[end]
+                            )[:, i]
+                        )
+                    )
                 end
             end
         end
@@ -1356,8 +2629,10 @@ function DiffEqBase._concrete_solve_adjoint(prob::SciMLBase.AbstractODEProblem, 
             lss_problem = ForwardLSSProblem(sol, sensealg, t = ts, dgdu_discrete = df)
             dp = shadow_forward(lss_problem)
         elseif sensealg isa AdjointLSS
-            adjointlss_problem = AdjointLSSProblem(sol, sensealg, t = ts,
-                                                   dgdu_discrete = df)
+            adjointlss_problem = AdjointLSSProblem(
+                sol, sensealg, t = ts,
+                dgdu_discrete = df
+            )
             dp = shadow_adjoint(adjointlss_problem)
         elseif sensealg isa NILSS
             nilss_prob = NILSSProblem(_prob, sensealg, t = ts, dgdu_discrete = df)
@@ -1369,61 +2644,481 @@ function DiffEqBase._concrete_solve_adjoint(prob::SciMLBase.AbstractODEProblem, 
             error("No concrete_solve implementation found for sensealg `$sensealg`. Did you spell the sensitivity algorithm correctly? Please report this error.")
         end
 
-        if originator isa SciMLBase.TrackerOriginator ||
-           originator isa SciMLBase.ReverseDiffOriginator
-            (NoTangent(), NoTangent(), NoTangent(), dp, NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+        return if originator isa SciMLBase.TrackerOriginator ||
+                originator isa SciMLBase.ReverseDiffOriginator
+            (
+                NoTangent(), NoTangent(), NoTangent(), dp, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
         else
-            (NoTangent(), NoTangent(), NoTangent(), NoTangent(), dp, NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+            (
+                NoTangent(), NoTangent(), NoTangent(), NoTangent(), dp, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
         end
     end
-    out, adjoint_sensitivity_backpass
+    return out, adjoint_sensitivity_backpass
 end
 
-function DiffEqBase._concrete_solve_adjoint(prob::Union{NonlinearProblem, SteadyStateProblem
-                                                        },
-                                            alg, sensealg::SteadyStateAdjoint,
-                                            u0, p, originator::SciMLBase.ADOriginator,
-                                            args...; save_idxs = nothing, kwargs...)
-    _prob = remake(prob, u0 = u0, p = p)
-    sol = solve(_prob, alg, args...; kwargs...)
+function SciMLBase._concrete_solve_adjoint(
+        prob::ConcreteNonlinearProblem,
+        alg, sensealg::SteadyStateAdjoint,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; save_idxs = nothing, kwargs...
+    )
+    _prob = remake(prob; u0, p)
+
+    sol = solve(_prob, alg, args...; wrap = Val(false), kwargs...)
     _save_idxs = save_idxs === nothing ? Colon() : save_idxs
 
     if save_idxs === nothing
         out = sol
     else
-        out = DiffEqBase.sensitivity_solution(sol, sol[_save_idxs])
+        out = SciMLBase.sensitivity_solution(sol, sol[_save_idxs])
+    end
+
+    _, repack_adjoint = if isscimlstructure(p)
+        Zygote.pullback(p) do p
+            t, _, _ = canonicalize(Tunable(), p)
+            t
+        end
+    elseif isfunctor(p)
+        ps, re = Functors.functor(p)
+        ps, x -> (re(x),)
+    else
+        nothing, x -> (x,)
     end
 
     function steadystatebackpass(Δ)
+        Δ = Δ isa AbstractThunk ? unthunk(Δ) : Δ
         # Δ = dg/dx or diffcache.dg_val
         # del g/del p = 0
         function df(_out, u, p, t, i)
-            if typeof(_save_idxs) <: Number
-                _out[_save_idxs] = Δ[_save_idxs]
-            elseif typeof(Δ) <: Number
-                @. _out[_save_idxs] = Δ
+            # A `NonlinearSolution` indexing cotangent puts the parameter part in
+            # `Δ.prob.p` and leaves `Δ.u === nothing` — meaning the loss has no
+            # direct dependence on the state, so `df` contributes zeros.
+            Δu = if Δ isa Union{Number, AbstractArray}
+                Δ
+            elseif hasproperty(Δ, :u)
+                unthunk(Δ.u)
             else
-                @. _out[_save_idxs] = Δ[_save_idxs]
+                Δ
+            end
+            if Δu === nothing || Δu isa AbstractZero
+                isnothing(_out) && return _out
+                _out .= 0
+                return _out
+            end
+            return if _save_idxs isa Number
+                _out[_save_idxs] = Δu[_save_idxs]
+            elseif Δu isa Number
+                @. _out[_save_idxs] = Δu
+            elseif Δu isa AbstractArray{<:AbstractArray} || Δu isa AbstractVectorOfArray ||
+                    Δu isa AbstractArray
+                @. _out[_save_idxs] = Δu[_save_idxs]
+            elseif isnothing(_out)
+                _out
+            else
+                @. _out[_save_idxs] = Δu.u[_save_idxs]
             end
         end
-        dp = adjoint_sensitivities(sol, alg; sensealg = sensealg, dgdu = df)
 
-        if originator isa SciMLBase.TrackerOriginator ||
-           originator isa SciMLBase.ReverseDiffOriginator
-            (NoTangent(), NoTangent(), NoTangent(), dp, NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+        dp_full = adjoint_sensitivities(sol, alg; sensealg, dgdu = df)
+
+        # When diff_tunables=Val(false), dp_full is the full parameter
+        # gradient (SciMLStructure). Return it as a NamedTuple tangent so
+        # the AD reverse rule can accumulate into all shadow components
+        # (including caches for SCCNonlinearProblem). This applies to all
+        # originators — diff_tunables=Val(false) is itself opt-in.
+        dp_tangent = if hasproperty(sensealg, :diff_tunables) &&
+                sensealg.diff_tunables isa Val{false} &&
+                isscimlstructure(dp_full)
+            originator isa SciMLBase.EnzymeOriginator ? dp_full : to_nt(dp_full)
         else
-            (NoTangent(), NoTangent(), NoTangent(), NoTangent(), dp, NoTangent(),
-             ntuple(_ -> NoTangent(), length(args))...)
+            dp = if isscimlstructure(dp_full)
+                canonicalize(Tunable(), dp_full)[1]
+            elseif isfunctor(dp_full)
+                Functors.functor(dp_full)[1]
+            else
+                dp_full
+            end
+
+            dp = Zygote.accum(dp, tunable_cotangent(p, solution_parameter_cotangent(Δ)))
+
+            # Repack the flat tunable cotangent `dp` into the parameter's
+            # structural tangent (a NamedTuple for MTKParameters; identity for
+            # plain-array params). The EnzymeOriginator `solve_up` reverse rule
+            # accumulates structural tangents field-wise, so returning a flat
+            # vector here broadcasts against the structured shadow (e.g. an
+            # `MTKParameters`) and errors.
+            repack_adjoint(dp)[1]
+        end
+
+        return if originator isa SciMLBase.TrackerOriginator ||
+                originator isa SciMLBase.ReverseDiffOriginator
+            (
+                NoTangent(), NoTangent(), NoTangent(), dp_tangent, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        else
+            (
+                NoTangent(), NoTangent(), NoTangent(),
+                NoTangent(), dp_tangent, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
         end
     end
-    out, steadystatebackpass
+    return out, steadystatebackpass
+end
+
+# The least-squares adjoint differentiates the (projected) stationarity
+# equation rather than the residual system: residuals are rectangular and need
+# not vanish at active bounds, so components pinned at a bound carry zero
+# sensitivity while free components satisfy the constrained stationarity
+# system. The adjoint solve itself lives in NonlinearSolveBase
+# (`nlls_solve_adjoint_dp`), which shares the `nlls_generate_vjp_function`
+# machinery used by the ForwardDiff sensitivity path.
+function SciMLBase._concrete_solve_adjoint(
+        prob::SciMLBase.NonlinearLeastSquaresProblem, alg,
+        sensealg::Union{Nothing, SciMLBase.AbstractSensitivityAlgorithm},
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; save_idxs = nothing, kwargs...
+    )
+    if !(sensealg === nothing || sensealg isa SteadyStateAdjoint)
+        throw(
+            ArgumentError(
+                "NonlinearLeastSquaresProblem only supports the default \
+                 stationarity adjoint (`SteadyStateAdjoint`). Got sensealg = \
+                 $(nameof(typeof(sensealg)))."
+            )
+        )
+    end
+    if p === nothing || p isa SciMLBase.NullParameters
+        error(
+            "Your model does not have parameters, and thus it is impossible to \
+             calculate the derivative of the solution with respect to the \
+             parameters."
+        )
+    end
+    p isa Union{Number, AbstractArray} || throw(
+        ArgumentError(
+            "Reverse-mode differentiation of a NonlinearLeastSquaresProblem \
+             currently supports only scalar or array parameters; got \
+             $(typeof(p))."
+        )
+    )
+
+    _prob = remake(prob; u0, p)
+    # `_prob` is already concrete, so call `solve_call` directly: re-entering
+    # `solve`/`solve_up` re-runs `get_concrete_problem`, which re-wraps `f.f` in
+    # `AutoSpecializeCallable`. On the Enzyme originator path `_prob.f.f` was
+    # deliberately unwrapped to match the callable used in the traced forward
+    # solve, and re-wrapping makes the returned `NonlinearSolution`'s type
+    # disagree with the rule's declared primal type.
+    kwargs_filtered = NamedTuple(filter(x -> x[1] != :originator, kwargs))
+    sol = if alg === nothing
+        NonlinearSolveBase.solve_call(_prob, args...; kwargs_filtered...)
+    else
+        NonlinearSolveBase.solve_call(_prob, alg, args...; kwargs_filtered...)
+    end
+    out = save_idxs === nothing ? sol :
+        SciMLBase.sensitivity_solution(sol, sol.u[save_idxs])
+
+    function nlls_solve_adjoint_backpass(Δ)
+        Δ = Δ isa AbstractThunk ? unthunk(Δ) : Δ
+        # `Tangent` forwards `getproperty` to its backing, so `Δ.u` also covers
+        # the `Tangent{<:NonlinearSolution}` case.
+        Δu = if Δ isa Union{Number, AbstractArray}
+            Δ
+        elseif hasproperty(Δ, :u)
+            Δ.u
+        else
+            Δ
+        end
+        Δu = Δu isa AbstractThunk ? unthunk(Δu) : Δu
+        (Δu === nothing || Δu isa ChainRulesCore.AbstractZero) && (Δu = zero(sol.u))
+        dp = NonlinearSolveBase.nlls_solve_adjoint_dp(_prob, sol, p, Δu, save_idxs)
+        dp = Zygote.accum(dp, tunable_cotangent(p, solution_parameter_cotangent(Δ)))
+        return if originator isa Union{
+                SciMLBase.TrackerOriginator, SciMLBase.ReverseDiffOriginator,
+            }
+            (
+                NoTangent(), NoTangent(), NoTangent(), dp, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        else
+            (
+                NoTangent(), NoTangent(), NoTangent(),
+                NoTangent(), dp, NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        end
+    end
+    return out, nlls_solve_adjoint_backpass
+end
+
+function SciMLBase._concrete_solve_adjoint(
+        prob::AbstractOptimizationProblem,
+        alg, sensealg::Nothing,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; kwargs...
+    )
+    # Auto-select the optimization adjoint: use the constrained KKT adjoint
+    # (`OptimizationAdjoint`) when the problem carries constraints — general constraints
+    # (`cons`) or variable bounds (`lb`/`ub`), both of which enter the KKT system — otherwise
+    # the stationarity-only `UnconstrainedOptimizationAdjoint`. Bounds matter: at an active
+    # bound the stationarity premise ∇f(u*) = 0 fails, so the unconstrained adjoint would
+    # silently return wrong sensitivities.
+    unconstrained = prob.f.cons === nothing && prob.lb === nothing && prob.ub === nothing
+    default_sensealg = unconstrained ?
+        UnconstrainedOptimizationAdjoint() : OptimizationAdjoint()
+    return SciMLBase._concrete_solve_adjoint(
+        prob, alg, default_sensealg,
+        u0, p, originator, args...; kwargs...
+    )
+end
+
+# Extract an explicit parameter cotangent carried on an `OptimizationSolution` tangent `Δ`.
+#
+# The optimization backpasses were adapted from the NonlinearSolution one, which reads
+# `Δ.prob.p`. `OptimizationSolution` has no `prob` field — its parameters live in the cache. And
+# `cache.p` is only a `getproperty` alias on the *primal* `OptimizationCache` (which has no real
+# `p` field, only `reinit_cache::ReInitCache` holding `(u0, p)`); that alias does not apply to a
+# `Tangent`, which is keyed by real struct fields. So the parameter cotangent is at
+# `cache.reinit_cache.p` for an `OptimizationCache`, or `cache.p` for a `DefaultOptimizationCache`
+# (where `p` *is* a real field). Navigate both defensively: a solution tangent carrying no
+# parameter contribution — the common case, including the Zygote flow that unwraps to a
+# `u`-cotangent before this branch — yields `ZeroTangent()`.
+function _optsol_param_cotangent(Δ)
+    cache_t = tangent_field(Δ, :cache)
+    p_t = tangent_field(tangent_field(cache_t, :reinit_cache), :p)
+    (p_t isa ZeroTangent || p_t isa NoTangent) || return p_t
+    return tangent_field(cache_t, :p)
+end
+
+function SciMLBase._concrete_solve_adjoint(
+        prob::AbstractOptimizationProblem,
+        alg, sensealg::UnconstrainedOptimizationAdjoint,
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; save_idxs = nothing, kwargs...
+    )
+    _prob = remake(prob, u0 = u0, p = p)
+
+    # Solve the optimization problem
+    opt_sol = solve(_prob, alg, args...; kwargs...)
+
+    opt_f = _prob.f
+
+    if opt_f.grad === nothing
+        grad_fn = if sensealg.objective_ad isa Bool && !sensealg.objective_ad
+            (G, u, p) -> FiniteDiff.finite_difference_gradient!(G, Base.Fix2(opt_f, p), u)
+        else
+            (G, u, p) -> ForwardDiff.gradient!(G, Base.Fix2(opt_f, p), u)
+        end
+        nlprob = NonlinearProblem(grad_fn, opt_sol.u, p)
+    else
+        nlprob = NonlinearProblem(opt_f.grad, opt_sol.u, p)
+    end
+
+    # Wrap the optimization solution in a NonlinearSolution with the gradient function
+    # This is used internally for adjoint computation but not returned
+    sol = SciMLBase.build_solution(
+        nlprob, nothing, opt_sol.u, opt_sol.objective;
+        retcode = opt_sol.retcode,
+        original = opt_sol
+    )
+
+    _save_idxs = save_idxs === nothing ? Colon() : save_idxs
+
+    # Return the OptimizationSolution, not the NonlinearSolution wrapper
+    if save_idxs === nothing
+        out = opt_sol
+    else
+        out = SciMLBase.sensitivity_solution(opt_sol, opt_sol[_save_idxs])
+    end
+
+    _, repack_adjoint = if isscimlstructure(p)
+        Zygote.pullback(p) do p
+            t, _, _ = canonicalize(Tunable(), p)
+            t
+        end
+    elseif isfunctor(p)
+        ps, re = Functors.functor(p)
+        ps, x -> (re(x),)
+    else
+        nothing, x -> (x,)
+    end
+
+    function steadystatebackpass(Δ)
+        Δ = Δ isa AbstractThunk ? unthunk(Δ) : Δ
+        # Δ = dg/dx or diffcache.dg_val
+        # del g/del p = 0
+        function df(_out, u, p, t, i)
+            Δu = if Δ isa Union{Number, AbstractArray}
+                Δ
+            elseif hasproperty(Δ, :u)
+                unthunk(Δ.u)
+            else
+                Δ
+            end
+            if Δu === nothing || Δu isa AbstractZero
+                isnothing(_out) && return _out
+                _out .= 0
+                return _out
+            end
+            return if _save_idxs isa Number
+                _out[_save_idxs] = Δu[_save_idxs]
+            elseif Δu isa Number
+                @. _out[_save_idxs] = Δu
+            elseif Δu isa AbstractArray{<:AbstractArray} || Δu isa AbstractVectorOfArray ||
+                    Δu isa AbstractArray
+                @. _out[_save_idxs] = Δu[_save_idxs]
+            elseif isnothing(_out)
+                _out
+            else
+                @. _out[_save_idxs] = Δu.u[_save_idxs]
+            end
+        end
+        # Convert UnconstrainedOptimizationAdjoint to SteadyStateAdjoint for the adjoint computation
+        steady_sensealg = SteadyStateAdjoint(
+            autojacvec = sensealg.autojacvec,
+            linsolve = sensealg.linsolve,
+            linsolve_kwargs = sensealg.linsolve_kwargs
+        )
+        dp = adjoint_sensitivities(sol, nothing; sensealg = steady_sensealg, dgdu = df)
+        dp, Δtunables = if Δ isa AbstractArray || Δ isa Number
+            # if Δ isa AbstractArray, the gradients correspond to `u`
+            # this is something that needs changing in the future, but
+            # this is the applicable till the movement to structuaral
+            # tangents is completed
+            dp, Δtunables = if isscimlstructure(dp)
+                dp, _, _ = canonicalize(Tunable(), dp)
+                dp, nothing
+            elseif isfunctor(dp)
+                dp, _ = Functors.functor(dp)
+                dp, nothing
+            else
+                dp, nothing
+            end
+        else
+            # Structural tangent. Pull any explicit parameter cotangent from the solution
+            # tangent's cache (`_optsol_param_cotangent`), then combine it with the KKT `dp`.
+            if isscimlstructure(p) && !(p isa AbstractArray)
+                dp, _, _ = canonicalize(Tunable(), dp)
+            elseif isfunctor(p)
+                dp, _ = Functors.functor(dp)
+            end
+            dp, tunable_cotangent(p, _optsol_param_cotangent(Δ))
+        end
+
+        dp = Zygote.accum(dp, Δtunables)
+
+        return if originator isa SciMLBase.TrackerOriginator ||
+                originator isa SciMLBase.ReverseDiffOriginator
+            (
+                NoTangent(), NoTangent(), NoTangent(), repack_adjoint(dp)[1], NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        else
+            (
+                NoTangent(), NoTangent(), NoTangent(),
+                NoTangent(), repack_adjoint(dp)[1], NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        end
+    end
+    return out, steadystatebackpass
+end
+
+function SciMLBase._concrete_solve_adjoint(
+        prob::AbstractOptimizationProblem,
+        alg, sensealg::OptimizationAdjoint{CS, AD, FDT},
+        u0, p, originator::SciMLBase.ADOriginator,
+        args...; save_idxs = nothing, kwargs...
+    ) where {CS, AD, FDT}
+
+    _prob = remake(prob, u0 = u0, p = p)
+    opt_sol = solve(_prob, alg, args...; kwargs...)
+
+    _save_idxs = save_idxs === nothing ? Colon() : save_idxs
+    out = if save_idxs === nothing
+        opt_sol
+    else
+        SciMLBase.sensitivity_solution(opt_sol, opt_sol[_save_idxs])
+    end
+
+    _, repack_adjoint = if isscimlstructure(p)
+        Zygote.pullback(p) do p
+            t, _, _ = canonicalize(Tunable(), p)
+            t
+        end
+    elseif isfunctor(p)
+        ps, re = Functors.functor(p)
+        ps, x -> (re(x),)
+    else
+        nothing, x -> (x,)
+    end
+
+    function optimizationbackpass(Δ)
+        Δ = Δ isa AbstractThunk ? unthunk(Δ) : Δ
+        function df(_out, _u, _p, _t, _i)
+            return if _save_idxs isa Number
+                _out[_save_idxs] = Δ isa AbstractArray ? Δ[_save_idxs] : Δ.u[_save_idxs]
+            elseif Δ isa Number
+                @. _out[_save_idxs] = Δ
+            elseif Δ isa AbstractArray
+                @. _out[_save_idxs] = Δ[_save_idxs]
+            elseif isnothing(_out)
+                _out
+            else
+                @. _out[_save_idxs] = Δ.u[_save_idxs]
+            end
+        end
+        dp = adjoint_sensitivities(opt_sol, nothing; sensealg = sensealg, dgdu = df)
+
+        dp, Δtunables = if Δ isa AbstractArray || Δ isa Number
+            dp, Δtunables = if isscimlstructure(dp)
+                dp, _, _ = canonicalize(Tunable(), dp)
+                dp, nothing
+            elseif isfunctor(dp)
+                dp, _ = Functors.functor(dp)
+                dp, nothing
+            else
+                dp, nothing
+            end
+        else
+            # Structural tangent. Pull any explicit parameter cotangent from the solution
+            # tangent's cache (`_optsol_param_cotangent`), then combine it with the KKT `dp`.
+            if isscimlstructure(p) && !(p isa AbstractArray)
+                dp, _, _ = canonicalize(Tunable(), dp)
+            elseif isfunctor(p)
+                dp, _ = Functors.functor(dp)
+            end
+            dp, tunable_cotangent(p, _optsol_param_cotangent(Δ))
+        end
+
+        dp = Zygote.accum(dp, Δtunables)
+
+        return if originator isa SciMLBase.TrackerOriginator ||
+                originator isa SciMLBase.ReverseDiffOriginator
+            (
+                NoTangent(), NoTangent(), NoTangent(), repack_adjoint(dp)[1], NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        else
+            (
+                NoTangent(), NoTangent(), NoTangent(),
+                NoTangent(), repack_adjoint(dp)[1], NoTangent(),
+                ntuple(_ -> NoTangent(), length(args))...,
+            )
+        end
+    end
+
+    return out, optimizationbackpass
 end
 
 function fix_endpoints(sensealg, sol, ts)
-    @warn "Endpoints do not match. Return code: $(sol.retcode). Likely your time range is not a multiple of `saveat`. sol.t[end]: $(sol.t[end]), ts[end]: $(ts[end])"
+    @warn "Endpoints do not match. Return code: $(sol.retcode). Likely your time range is not a multiple of `saveat`. sol.t[end]: $(last(current_time(sol))), ts[end]: $(ts[end])"
     ts = collect(ts)
-    push!(ts, sol.t[end])
+    return push!(ts, last(current_time(sol)))
 end

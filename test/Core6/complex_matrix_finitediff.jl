@@ -1,0 +1,66 @@
+using OrdinaryDiffEq, Zygote, SciMLSensitivity, ComponentArrays, Lux, ForwardDiff
+using OrdinaryDiffEqLowOrderRK: BS5
+using Test, Random, LinearAlgebra
+
+const T = 10.0;
+const ω = π / T;
+const id = Matrix{Complex{Float64}}(I, 2, 2);
+const u0 = id;
+const utarget = Matrix{Complex{Float64}}([im 0; 0 -im]);
+
+ann = Lux.Chain(Lux.Dense(1, 32), Lux.Dense(32, 32, tanh), Lux.Dense(32, 1));
+rng = Random.default_rng();
+ip, st = Lux.setup(rng, ann);
+
+function f_nn(u, p, t)
+    local a, _ = ann([t / T], p, st)
+    local A = [a[1] 0.0; 0.0 -a[1]]
+    return -(im * A) * u
+end
+
+tspan = (0.0, T)
+prob_ode = ODEProblem(f_nn, u0, tspan, ComponentArray(ip));
+
+function loss_adjoint(p; sensealg = nothing, kwargs...)
+    local prediction = solve(
+        prob_ode, BS5(); p, abstol = 1.0e-13, reltol = 1.0e-13, sensealg, kwargs...
+    )
+    local usol = prediction.u[end]
+    local loss = abs(1.0 - abs(tr(usol * utarget') / 2))
+    return loss
+end
+
+dp1 = Zygote.gradient(loss_adjoint, ComponentArray(ip))
+dp2 = ForwardDiff.gradient(loss_adjoint, ComponentArray(ip))
+dp3 = Zygote.gradient(
+    x -> loss_adjoint(
+        x, sensealg = InterpolatingAdjoint(autodiff = false, autojacvec = false)
+    ),
+    ComponentArray(ip)
+)
+
+# An empty CallbackSet behaves identically to passing no callback; it must
+# not force the callback-only ReverseDiffVJP path.
+dp4 = Zygote.gradient(
+    x -> loss_adjoint(
+        x, callback = CallbackSet()
+    ),
+    ComponentArray(ip)
+)
+
+@test dp1[1] ≈ dp2 atol = 1.0e-2
+@test dp1[1] ≈ dp3[1] atol = 5.0e-2
+@test dp1[1] ≈ dp4[1] atol = 1.0e-2
+
+# On Julia >= 1.12 DiffEqBase injects the type-erased
+# `callback = CallbackSet(Any[], Any[])` into solve kwargs. The
+# vector-backed fields only exist in newer SciMLBase.
+if hasmethod(CallbackSet, Tuple{Vector{Any}, Vector{Any}})
+    dp5 = Zygote.gradient(
+        x -> loss_adjoint(
+            x, callback = CallbackSet(Any[], Any[])
+        ),
+        ComponentArray(ip)
+    )
+    @test dp1[1] ≈ dp5[1] atol = 1.0e-2
+end

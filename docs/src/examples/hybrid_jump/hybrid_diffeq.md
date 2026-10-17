@@ -8,7 +8,17 @@ model and the universal differential equation is trained to uncover the missing
 dynamical equations.
 
 ```@example
-using DiffEqFlux, Flux, DifferentialEquations, Plots
+import ComponentArrays as CA
+import Random
+import SciMLSensitivity as SMS
+import Lux
+import Enzyme
+import OrdinaryDiffEq as ODE
+import Plots
+import Optimization as OPT
+import OptimizationOptimisers as OPO
+import DiffEqCallbacks as DEC
+
 u0 = Float32[2.0; 0.0]
 datasize = 100
 tspan = (0.0f0, 10.5f0)
@@ -17,56 +27,57 @@ dosetimes = [1.0, 2.0, 4.0, 8.0]
 function affect!(integrator)
     integrator.u = integrator.u .+ 1
 end
-cb_ = PresetTimeCallback(dosetimes, affect!, save_positions = (false, false))
+cb_ = DEC.PresetTimeCallback(dosetimes, affect!, save_positions = (false, false))
 function trueODEfunc(du, u, p, t)
     du .= -u
 end
 t = range(tspan[1], tspan[2], length = datasize)
 
-prob = ODEProblem(trueODEfunc, u0, tspan)
-ode_data = Array(solve(prob, Tsit5(), callback = cb_, saveat = t))
-dudt2 = Flux.Chain(Flux.Dense(2, 50, tanh),
-                   Flux.Dense(50, 2))
-p, re = Flux.destructure(dudt2) # use this p as the initial condition!
+prob = ODE.ODEProblem(trueODEfunc, u0, tspan)
+ode_data = Array(ODE.solve(prob, ODE.Tsit5(), callback = cb_, saveat = t))
+
+dudt2 = Lux.Chain(Lux.Dense(2, 50, tanh), Lux.Dense(50, 2))
+ps, st = Lux.setup(Random.default_rng(), dudt2)
 
 function dudt(du, u, p, t)
     du[1:2] .= -u[1:2]
-    du[3:end] .= re(p)(u[1:2]) #re(p)(u[3:end])
+    du[3:end] .= first(dudt2(u[1:2], p, st))
 end
 z0 = Float32[u0; u0]
-prob = ODEProblem(dudt, z0, tspan)
+prob = ODE.ODEProblem(dudt, z0, tspan)
 
 affect!(integrator) = integrator.u[1:2] .= integrator.u[3:end]
-callback = PresetTimeCallback(dosetimes, affect!, save_positions = (false, false))
+cb = DEC.PresetTimeCallback(dosetimes, affect!, save_positions = (false, false))
 
-function predict_n_ode()
-    _prob = remake(prob, p = p)
-    Array(solve(_prob, Tsit5(), u0 = z0, p = p, callback = callback, saveat = t,
-                sensealg = ReverseDiffAdjoint()))[1:2, :]
-    #Array(solve(prob,Tsit5(),u0=z0,p=p,saveat=t))[1:2,:]
+function predict_n_ode(p)
+    _prob = ODE.remake(prob; p)
+    Array(ODE.solve(_prob, ODE.Tsit5(); u0 = z0, p, callback = cb, saveat = t))[1:2, :]
 end
 
-function loss_n_ode()
-    pred = predict_n_ode()
+function loss_n_ode(p, _)
+    pred = predict_n_ode(p)
     loss = sum(abs2, ode_data .- pred)
     loss
 end
-loss_n_ode() # n_ode.p stores the initial parameters of the neural ODE
+loss_n_ode(ps, nothing)
 
-cba = function (; doplot = false) #callback function to observe training
-    pred = predict_n_ode()
+cba = function (state, l; doplot = false) #callback function to observe training
+    pred = predict_n_ode(state.u)
     display(sum(abs2, ode_data .- pred))
     # plot current prediction against data
-    pl = scatter(t, ode_data[1, :], label = "data")
-    scatter!(pl, t, pred[1, :], label = "prediction")
-    display(plot(pl))
+    pl = Plots.scatter(t, ode_data[1, :], label = "data")
+    Plots.scatter!(pl, t, pred[1, :], label = "prediction")
+    display(Plots.plot(pl))
     return false
 end
-cba()
 
-ps = Flux.params(p)
-data = Iterators.repeated((), 200)
-Flux.train!(loss_n_ode, ps, data, ADAM(0.05), cb = cba)
+res = OPT.solve(
+    OPT.OptimizationProblem(
+        OPT.OptimizationFunction(
+            loss_n_ode, OPT.AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+        ),
+        CA.ComponentArray(ps)),
+    OPO.Adam(0.05); callback = cba, maxiters = 1000)
 ```
 
 ![Hybrid Universal Differential Equation](https://user-images.githubusercontent.com/1814174/91687561-08fc5900-eb2e-11ea-9f26-6b794e1e1248.gif)

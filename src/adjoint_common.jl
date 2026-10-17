@@ -1,6 +1,17 @@
-struct AdjointDiffCache{UF, PF, G, TJ, PJT, uType, JC, GC, PJC, JNC, PJNC, rateType, DG1,
-                        DG2, DI,
-                        AI, FM}
+# Wraps a pre-allocated dense primal buffer for use with Enzyme.Duplicated when the
+# parameter is a view-backed array (e.g. ComponentArray with SubArray data). Enzyme
+# requires primal and shadow to have the same concrete type; since the shadow is always
+# a fresh dense allocation, the primal must also be dense. We pre-allocate once here
+# and copyto! the current parameter values at each adjoint step.
+struct EnzymeViewPrimalBuffer{T}
+    buf::T
+end
+
+struct AdjointDiffCache{
+        UF, PF, G, TJ, PJT, uType, JC, GC, PJC, JNC, PJNC, rateType, DG1,
+        DG2, DI,
+        AI, FM, tType, rType, AI2, DI2,
+    }
     uf::UF
     pf::PF
     g::G
@@ -19,113 +30,227 @@ struct AdjointDiffCache{UF, PF, G, TJ, PJT, uType, JC, GC, PJC, JNC, PJNC, rateT
     algevar_idxs::AI
     factorized_mass_matrix::FM
     issemiexplicitdae::Bool
+    tunables::tType
+    repack::rType
+    # Fully implicit DAE (`DAEProblem`) structure: indices of the algebraic and
+    # differential equations (zero/nonzero rows of ∂F/∂(du)), which for
+    # mass-matrix DAEs coincide with the variable indices, and whether the
+    # system is Hessenberg index-2.
+    algeeq_idxs::AI2
+    diffeq_idxs::DI2
+    isdae::Bool
+    index2::Bool
 end
 
-function Base.show(io::IO,
-                   t::Type{
-                           AdjointDiffCache{UF, PF, G, TJ, PJT, uType, JC, GC, PJC, JNC,
-                                            PJNC, rateType, DG1,
-                                            DG2, DI,
-                                            AI, FM}}) where {UF, PF, G, TJ, PJT, uType, JC,
-                                                             GC, PJC, JNC, PJNC, rateType,
-                                                             DG1,
-                                                             DG2, DI,
-                                                             AI, FM}
-    if TruncatedStacktraces.VERBOSE[]
-        print(io,
-              "AdjointDiffCache{$UF,$PF,$G,$TJ,$PJT,$uType,$JC,$GC,$PJC,$JNC,$PJNC,$rateType,$DG1,$DG2,$DI,$AI,$FM}")
-    else
-        print(io, "AdjointDiffCache{…}")
+# `promote_f` wraps `f`/`g` of `ODEFunction`/`SDEFunction` in fixed-signature
+# FunctionWrappers under AutoSpecialize; sensitivity evaluation calls them with
+# SubArray/Dual arguments that the wrapper rejects, so strip the wrapper here.
+function _despecialized_f(f::ODEFunction)
+    if f.f isa FunctionWrappersWrappers.FunctionWrappersWrapper
+        return ODEFunction{isinplace(f), true}(unwrapped_f(f))
     end
+    return f
 end
+function _despecialized_f(f::SDEFunction)
+    if f.f isa FunctionWrappersWrappers.FunctionWrappersWrapper ||
+            f.g isa FunctionWrappersWrappers.FunctionWrappersWrapper
+        _uf = unwrapped_f(f)
+        return SDEFunction{isinplace(f), true}(
+            _uf.f, _uf.g;
+            mass_matrix = _uf.mass_matrix, analytic = _uf.analytic,
+            tgrad = _uf.tgrad, jac = _uf.jac, jvp = _uf.jvp, vjp = _uf.vjp,
+            jac_prototype = _uf.jac_prototype, sparsity = _uf.sparsity,
+            Wfact = _uf.Wfact, Wfact_t = _uf.Wfact_t,
+            paramjac = _uf.paramjac, ggprime = _uf.ggprime,
+            observed = _uf.observed, colorvec = _uf.colorvec,
+            sys = _uf.sys, initialization_data = _uf.initialization_data
+        )
+    end
+    return f
+end
+_despecialized_f(f) = f
+
+# Build a FullSpecialize copy of the (possibly FunctionWrapper-wrapped) `f` for
+# ForwardDiffSensitivity solves whose u0/p carry Dual numbers; the wrapped
+# function only supports the signature `promote_f` compiled it for.
+function _dual_f(f::ODEFunction, elT)
+    _uf = unwrapped_f(f)
+    if f.jac_prototype !== nothing
+        return ODEFunction{isinplace(f), SciMLBase.FullSpecialize}(
+            _uf; jac_prototype = convert.(elT, f.jac_prototype)
+        )
+    end
+    return ODEFunction{isinplace(f), SciMLBase.FullSpecialize}(_uf)
+end
+function _dual_f(f::SDEFunction, elT)
+    _uf = unwrapped_f(f)
+    jp = f.jac_prototype === nothing ? nothing : convert.(elT, f.jac_prototype)
+    return SDEFunction{isinplace(f), SciMLBase.FullSpecialize}(
+        _uf.f, _uf.g;
+        mass_matrix = _uf.mass_matrix, analytic = _uf.analytic,
+        tgrad = _uf.tgrad, jac = _uf.jac, jvp = _uf.jvp, vjp = _uf.vjp,
+        jac_prototype = jp, sparsity = _uf.sparsity,
+        Wfact = _uf.Wfact, Wfact_t = _uf.Wfact_t,
+        paramjac = _uf.paramjac, ggprime = _uf.ggprime,
+        observed = _uf.observed, colorvec = _uf.colorvec,
+        sys = _uf.sys, initialization_data = _uf.initialization_data
+    )
+end
+_dual_f(f, elT) = f
 
 """
     adjointdiffcache(g,sensealg,discrete,sol,dg,alg;quad=false)
 
 return (AdjointDiffCache, y)
 """
-function adjointdiffcache(g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f, alg;
-                          quad = false,
-                          noiseterm = false, needs_jac = false) where {G, DG1, DG2}
+function adjointdiffcache(
+        g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f, alg;
+        quad = false,
+        noiseterm = false, needs_jac = false, use_full_p = false
+    ) where {G, DG1, DG2}
     prob = sol.prob
-    if prob isa Union{SteadyStateProblem, NonlinearProblem}
-        @unpack u0, p = prob
+    u0 = state_values(prob)
+    if u0 === nothing
+        # MTK-generated nonlinear problems store the initial guess in the
+        # initialization data and leave `u0 === nothing`; the solved state is
+        # the only state-shaped value available for sizing adjoint caches.
+        u0 = prob isa AbstractNonlinearProblem ? state_values(sol) : state_values(sol)[end]
+    end
+    p = parameter_values(prob)
+    if use_full_p && p !== nothing && !(p isa SciMLBase.NullParameters)
+        # Use full parameter object (including caches) for VJP computation.
+        # Required for SCCNonlinearProblem where explicitfuns! write active
+        # data into non-tunable parameter components.
+        tunables, repack = p, identity
+    elseif p === nothing || p isa SciMLBase.NullParameters
+        tunables, repack = p, identity
+    elseif isscimlstructure(p)
+        tunables, repack, _ = canonicalize(Tunable(), p)
+    elseif isfunctor(p)
+        if !supports_structured_vjp(sensealg.autojacvec)
+            error(
+                "$(typeof(sensealg.autojacvec)) does not support Functors.jl parameter structs. " *
+                    "Use ZygoteVJP() instead."
+            )
+        end
+        tunables, repack = Functors.functor(p)
+    else
+        throw(SciMLStructuresCompatibilityError())
+    end
+    if prob isa AbstractNonlinearProblem
         tspan = (nothing, nothing)
         #elseif prob isa SDEProblem
-        #  @unpack tspan, u0, p = prob
+        #  (; tspan, u0, p) = prob
     else
-        @unpack u0, p, tspan = prob
+        tspan = prob.tspan
     end
 
     isinplace = DiffEqBase.isinplace(prob)
     isRODE = prob isa RODEProblem
+    isDAE = prob isa SciMLBase.AbstractDAEProblem
     autojacvec = sensealg.autojacvec
 
+    if isDAE && !(
+            autojacvec isa Union{ReverseDiffVJP, ZygoteVJP, EnzymeVJP, TrackerVJP} ||
+                autojacvec isa Bool
+        )
+        error(
+            "$(nameof(typeof(autojacvec))) is not currently supported for DAEProblem adjoints. " *
+                "Use `ReverseDiffVJP()`, `EnzymeVJP()`, `ZygoteVJP()`, `TrackerVJP()`, or `autojacvec = false`."
+        )
+    end
+
     if isRODE
-        _W = last(sol.W)
+        _W = last(sol.W.W)
     else
         _W = nothing
     end
 
-    if prob isa Union{SteadyStateProblem, NonlinearProblem}
-        y = copy(sol.u)
+    if prob isa AbstractNonlinearProblem
+        y = copy(state_values(sol))
     else
-        y = copy(sol.u[end])
+        y = copy(state_values(sol)[end])
     end
 
-    if typeof(prob.p) <: DiffEqBase.NullParameters
+    if prob.p isa SciMLBase.NullParameters
         _p = similar(y, (0,))
+        _p .= false
     else
-        _p = prob.p
+        _p = tunables
     end
 
     _t = tspan[2]
 
-    # Remove any function wrappers: it breaks autodiff
-    unwrappedf = unwrapped_f(f)
+    # Remove any function wrappers: it breaks autodiff. For DAE residuals also
+    # unwrap the DAEFunction itself (see `dae_unwrapped_f`).
+    unwrappedf = isDAE ? dae_unwrapped_f(f) : unwrapped_f(f)
 
-    numparams = p === nothing || p === DiffEqBase.NullParameters() ? 0 : length(p)
-    numindvar = length(u0)
+    numparams = p === nothing || p === SciMLBase.NullParameters() ? 0 : length(tunables)
+    numindvar = isnothing(u0) ? nothing : length(u0)
     isautojacvec = get_jacvec(sensealg)
 
     issemiexplicitdae = false
-    mass_matrix = sol.prob.f.mass_matrix
-    if mass_matrix isa UniformScaling
-        factorized_mass_matrix = mass_matrix'
-    elseif mass_matrix isa Tuple{UniformScaling, UniformScaling}
-        factorized_mass_matrix = (I', I')
+    index2 = false
+    if isDAE
+        # Fully implicit DAE residual F(du, u, p, t): classify the algebraic
+        # structure from the Jacobians at the terminal time and
+        # `differential_vars`, since there is no mass matrix to read it from.
+        _dy_terminal = similar(y)
+        sol(_dy_terminal, _t, Val{1})
+        diffvar_idxs, algevar_idxs, diffeq_idxs, algeeq_idxs,
+            index2 = dae_adjoint_structure(
+            unwrappedf, isinplace, _dy_terminal, y, p, _t,
+            prob.differential_vars
+        )
+        factorized_mass_matrix = nothing
     else
-        mass_matrix = mass_matrix'
-        diffvar_idxs = findall(x -> any(!iszero, @view(mass_matrix[:, x])),
-                               axes(mass_matrix, 2))
-        algevar_idxs = setdiff(eachindex(u0), diffvar_idxs)
-
-        # TODO: operator
-        if VERSION >= v"1.8-"
-            M̃ = @view mass_matrix[diffvar_idxs, diffvar_idxs]
+        mass_matrix = sol.prob.f.mass_matrix
+        if mass_matrix isa UniformScaling
+            factorized_mass_matrix = mass_matrix'
+        elseif mass_matrix isa Tuple{UniformScaling, UniformScaling}
+            factorized_mass_matrix = (I', I')
         else
-            M̃ = mass_matrix[diffvar_idxs, diffvar_idxs]
+            mass_matrix = mass_matrix'
+            diffvar_idxs = findall(
+                x -> any(!iszero, @view(mass_matrix[:, x])),
+                axes(mass_matrix, 2)
+            )
+            algevar_idxs = setdiff(eachindex(u0), diffvar_idxs)
+
+            # TODO: operator
+            M̃ = @view mass_matrix[diffvar_idxs, diffvar_idxs]
+
+            factorized_mass_matrix = lu(M̃, check = false)
+            issuccess(factorized_mass_matrix) ||
+                error("The submatrix corresponding to the differential variables of the mass matrix must be nonsingular!")
+            isempty(algevar_idxs) || (issemiexplicitdae = true)
         end
-
-        factorized_mass_matrix = lu(M̃, check = false)
-        issuccess(factorized_mass_matrix) ||
-            error("The submatrix corresponding to the differential variables of the mass matrix must be nonsingular!")
-        isempty(algevar_idxs) || (issemiexplicitdae = true)
-    end
-    if !issemiexplicitdae
-        diffvar_idxs = eachindex(u0)
-        algevar_idxs = 1:0
+        if !issemiexplicitdae
+            diffvar_idxs = isnothing(u0) ? nothing : eachindex(u0)
+            algevar_idxs = 1:0
+        end
+        # For mass-matrix problems, equation i and variable i pair up.
+        algeeq_idxs = algevar_idxs
+        diffeq_idxs = diffvar_idxs
     end
 
-    if !needs_jac && !(issemiexplicitdae || !isautojacvec)
+    if !needs_jac && !issemiexplicitdae && (!(autojacvec isa Bool) || isDAE)
+        # The implicit-DAE paths compute their Jacobians on the fly from the
+        # residual, so no dense J buffer is needed even for `autojacvec = false`.
         J = nothing
     else
-        if SciMLBase.forwarddiffs_model_time(alg)
-            # 1 chunk is fine because it's only t
-            J = dualcache(similar(u0, numindvar, numindvar),
-                          ForwardDiff.pickchunksize(length(u0)))
+        if alg === nothing || SciMLBase.forwarddiffs_model_time(alg)
+            if !isnothing(u0)
+                # 1 chunk is fine because it's only t
+                _J = similar(u0, numindvar, numindvar)
+                _J .= 0
+                J = DiffCache(_J, ForwardDiff.pickchunksize(length(u0)))
+            else
+                J = nothing
+            end
         else
             J = similar(u0, numindvar, numindvar)
+            J .= 0
         end
     end
 
@@ -138,14 +263,18 @@ function adjointdiffcache(g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f
                 dg_val[1] .= false
                 dg_val[2] .= false
             else
-                dg_val = similar(u0, numindvar) # number of funcs size
-                dg_val .= false
+                if !isnothing(u0)
+                    dg_val = similar(u0, numindvar) # number of funcs size
+                    dg_val .= false
+                else
+                    dg_val = nothing
+                end
             end
         else
             pgpu = UGradientWrapper(g, _t, p)
-            pgpu_config = build_grad_config(sensealg, pgpu, u0, p)
+            pgpu_config = build_grad_config(sensealg, pgpu, u0, tunables)
             pgpp = ParamGradientWrapper(g, _t, u0)
-            pgpp_config = build_grad_config(sensealg, pgpp, p, p)
+            pgpp_config = build_grad_config(sensealg, pgpp, tunables, tunables)
             pg = (pgpu, pgpp)
             pg_config = (pgpu_config, pgpp_config)
             dg_val = (similar(u0, numindvar), similar(u0, numparams))
@@ -158,20 +287,20 @@ function adjointdiffcache(g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f
         pg_config = nothing
     end
 
-    if DiffEqBase.has_jac(f) || (J === nothing)
+    if SciMLBase.has_jac(f) || J === nothing
         jac_config = nothing
         uf = nothing
     else
         if isinplace
             if !isRODE
-                uf = DiffEqBase.UJacobianWrapper(unwrappedf, _t, p)
+                uf = SciMLBase.UJacobianWrapper(unwrappedf, _t, p)
             else
                 uf = RODEUJacobianWrapper(unwrappedf, _t, p, _W)
             end
             jac_config = build_jac_config(sensealg, uf, u0)
         else
             if !isRODE
-                uf = DiffEqBase.UDerivativeWrapper(unwrappedf, _t, p)
+                uf = SciMLBase.UDerivativeWrapper(unwrappedf, _t, p)
             else
                 uf = RODEUDerivativeWrapper(unwrappedf, _t, p, _W)
             end
@@ -182,11 +311,12 @@ function adjointdiffcache(g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f
     @assert autojacvec !== nothing
 
     if autojacvec isa ReverseDiffVJP
-        if prob isa Union{SteadyStateProblem, NonlinearProblem}
+        if prob isa AbstractNonlinearProblem
             if isinplace
                 tape = ReverseDiff.GradientTape((y, _p)) do u, p
-                    du1 = p !== nothing && p !== DiffEqBase.NullParameters() ?
-                          similar(p, size(u)) : similar(u)
+                    du1 = p !== nothing && p !== SciMLBase.NullParameters() ?
+                        similar(p, size(u)) : similar(u)
+                    du1 .= false
                     unwrappedf(du1, u, p, nothing)
                     return vec(du1)
                 end
@@ -201,35 +331,108 @@ function adjointdiffcache(g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f
                 paramjac_config = tape
             end
         elseif noiseterm &&
-               (!StochasticDiffEq.is_diagonal_noise(prob) || isnoisemixing(sensealg))
+                (!SciMLBase.is_diagonal_noise(prob) || isnoisemixing(sensealg))
             tape = nothing
             paramjac_config = tape
+        elseif isDAE
+            paramjac_config = get_dae_paramjac_config(
+                autojacvec, p, unwrappedf, y, _dy_terminal, _p, _t; isinplace
+            )
         else
-            paramjac_config = get_paramjac_config(autojacvec, p, unwrappedf, y, _p, _t;
-                                                  isinplace = isinplace,
-                                                  isRODE = isRODE, _W = _W)
+            paramjac_config = get_paramjac_config(
+                autojacvec, p, unwrappedf, y, _p, _t;
+                isinplace, isRODE, _W
+            )
         end
 
         pf = nothing
     elseif autojacvec isa EnzymeVJP
         paramjac_config = get_paramjac_config(autojacvec, p, f, y, _p, _t; numindvar, alg)
-        pf = get_pf(autojacvec; _f = unwrappedf, isinplace = isinplace, isRODE = isRODE)
-    elseif DiffEqBase.has_paramjac(f) || isautojacvec || quad ||
-           autojacvec isa EnzymeVJP
+        # must match the primal `_vecjacobian!(::EnzymeVJP)` differentiates
+        pf = get_pf(autojacvec; _f = enzyme_rhs(unwrappedf), isinplace, isRODE)
+        if isDAE
+            # The residual takes `du` as an extra differentiated argument; append
+            # its primal and shadow buffers to the standard Enzyme config.
+            paramjac_config = if paramjac_config[1] isa LazyBufferCache
+                (paramjac_config..., LazyBufferCache(), LazyBufferCache())
+            else
+                (paramjac_config..., zero(y), zero(y))
+            end
+        end
+        _needs_shadow = !(p isa SciMLBase.NullParameters) &&
+            isscimlstructure(p) && !(p isa AbstractArray)
+        _shadow_p = if _needs_shadow
+            # `repack` only writes the tunable fields and copies the rest of the
+            # parameter object (e.g. `initials`, `discrete`) *by reference* from
+            # `p`, so `repack(zero(tunables))` would alias the primal's non-tunable
+            # arrays. `_vecjacobian!` then `Enzyme.remake_zero!`s this shadow, which
+            # would zero the user's `p.initials` and corrupt the problem across
+            # repeated differentiation (#1470). `make_zero(p)` allocates a fully
+            # disjoint zeroed shadow; `canonicalize(Tunable(), _shadow_p)` still
+            # reads back the accumulated tunable gradient.
+            Enzyme.make_zero(p)
+        elseif !(p isa SciMLBase.NullParameters) && p isa AbstractArray &&
+                typeof(tunables) !== typeof(zero(tunables))
+            # tunables is a view-backed array (e.g. ComponentArray with SubArray data).
+            # zero(tunables) returns a dense array of a different concrete type, so
+            # Enzyme.Duplicated(p, tmp2) would throw a type mismatch. Pre-allocate a
+            # dense primal buffer here; at each adjoint step we copyto! the current p
+            # values and pass this buffer as the Enzyme primal instead of p itself.
+            EnzymeViewPrimalBuffer(copy(tunables))
+        else
+            nothing
+        end
+        paramjac_config = (paramjac_config..., Enzyme.make_zero(pf), _shadow_p)
+    elseif autojacvec isa MooncakeVJP
+        _pf = get_pf(autojacvec, prob, unwrappedf)
+        # Wrap pf to accept flat tunables and repack to full parameter struct,
+        # matching how ReverseDiff handles structured parameters.
+        _needs_repack = isscimlstructure(p) && !(p isa AbstractArray)
+        pf = if _needs_repack
+            if isRODE
+                let _pf = _pf, repack = repack
+                    (out, u, _tunables, t, W) -> _pf(out, u, repack(_tunables), t, W)
+                end
+            else
+                let _pf = _pf, repack = repack
+                    (out, u, _tunables, t) -> _pf(out, u, repack(_tunables), t)
+                end
+            end
+        else
+            _pf
+        end
+        paramjac_config = get_paramjac_config(
+            MooncakeLoaded(), autojacvec, pf, tunables, f, y, _t
+        )
+    elseif autojacvec isa ReactantVJP
+        pf = get_pf(autojacvec, prob, unwrappedf)
+        paramjac_config = get_paramjac_config(
+            ReactantLoaded(), autojacvec, pf, p, f, y, _t;
+            numindvar = numindvar, alg = alg
+        )
+    elseif SciMLBase.has_paramjac(f) || quad || !(autojacvec isa Bool) ||
+            autojacvec isa EnzymeVJP || isDAE
         paramjac_config = nothing
         pf = nothing
     else
+        _needs_repack = (isscimlstructure(p) && !(p isa AbstractArray)) || isfunctor(p)
         if isinplace &&
-           !(p === nothing || p === DiffEqBase.NullParameters())
+                !(p === nothing || p === SciMLBase.NullParameters())
             if !isRODE
-                pf = DiffEqBase.ParamJacobianWrapper(unwrappedf, _t, y)
+                _pjac_f = _needs_repack ?
+                    (du, u, p, t) -> unwrappedf(du, u, repack(p), t) :
+                    unwrappedf
+                pf = SciMLBase.ParamJacobianWrapper(_pjac_f, _t, y)
             else
                 pf = RODEParamJacobianWrapper(unwrappedf, _t, y, _W)
             end
-            paramjac_config = build_param_jac_config(sensealg, pf, y, p)
+            paramjac_config = build_param_jac_config(sensealg, pf, y, tunables)
         else
             if !isRODE
-                pf = ParamGradientWrapper(unwrappedf, _t, y)
+                _pgrad_f = _needs_repack ?
+                    (u, p, t) -> unwrappedf(u, repack(p), t) :
+                    unwrappedf
+                pf = ParamGradientWrapper(_pgrad_f, _t, y)
             else
                 pf = RODEParamGradientWrapper(unwrappedf, _t, y, _W)
             end
@@ -237,7 +440,16 @@ function adjointdiffcache(g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f
         end
     end
 
-    pJ = (quad || isautojacvec) ? nothing : similar(u0, numindvar, numparams)
+    pJ = if (quad || !(autojacvec isa Bool) || isDAE)
+        nothing
+    else
+        if !isnothing(u0)
+            _pJ = similar(u0, numindvar, numparams)
+            _pJ .= false
+        else
+            _pJ = nothing
+        end
+    end
 
     f_cache = isinplace ? deepcopy(u0) : nothing
 
@@ -250,20 +462,21 @@ function adjointdiffcache(g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f
             m = noise_rate_prototype === nothing ? numindvar : size(noise_rate_prototype)[2]
             if isinplace
                 for i in 1:m
-                    function noisetape(indx)
-                        if StochasticDiffEq.is_diagonal_noise(prob)
+                    function noisetape(idx)
+                        return if SciMLBase.is_diagonal_noise(prob)
                             ReverseDiff.GradientTape((y, _p, [_t])) do u, p, t
-                                du1 = p !== nothing && p !== DiffEqBase.NullParameters() ?
-                                      similar(p, size(u)) : similar(u)
+                                du1 = p !== nothing && p !== SciMLBase.NullParameters() ?
+                                    similar(p, size(u)) : similar(u)
+                                copyto!(du1, false)
                                 unwrappedf(du1, u, p, first(t))
-                                return du1[indx]
+                                return du1[idx]
                             end
                         else
                             ReverseDiff.GradientTape((y, _p, [_t])) do u, p, t
                                 du1 = similar(p, size(noise_rate_prototype))
                                 du1 .= false
                                 unwrappedf(du1, u, p, first(t))
-                                return du1[:, indx]
+                                return du1[:, idx]
                             end
                         end
                     end
@@ -276,14 +489,14 @@ function adjointdiffcache(g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f
                 end
             else
                 for i in 1:m
-                    function noisetapeoop(indx)
-                        if StochasticDiffEq.is_diagonal_noise(prob)
+                    function noisetapeoop(idx)
+                        return if SciMLBase.is_diagonal_noise(prob)
                             ReverseDiff.GradientTape((y, _p, [_t])) do u, p, t
-                                unwrappedf(u, p, first(t))[indx]
+                                unwrappedf(u, p, first(t))[idx]
                             end
                         else
                             ReverseDiff.GradientTape((y, _p, [_t])) do u, p, t
-                                unwrappedf(u, p, first(t))[:, indx]
+                                unwrappedf(u, p, first(t))[:, idx]
                             end
                         end
                     end
@@ -295,29 +508,74 @@ function adjointdiffcache(g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f
                     end
                 end
             end
+        elseif autojacvec isa EnzymeVJP
+            # Cache the reusable buffers so `_jacNoise!(::EnzymeVJP)` allocates
+            # nothing per reverse-solver step (mirrors the drift `_vecjacobian!`).
+            jac_noise_config = nothing
+            noise_rate_prototype = prob.noise_rate_prototype
+            _diag = SciMLBase.is_diagonal_noise(prob)
+            # Output-shaped buffers (state-shaped for diagonal noise, matrix-shaped
+            # for non-diagonal), plus the state-shaped primal/shadow.
+            _du_out = _diag ? zero(y) : zero(noise_rate_prototype)
+            _du_seed = _diag ? zero(y) : zero(noise_rate_prototype)
+            _u_buf = zero(y)
+            _du_u = zero(y)
+            _pf = get_pf(autojacvec; _f = unwrappedf, isinplace, isRODE)
+            _func_shadow = Enzyme.make_zero(_pf)
+            # Dense parameter-gradient shadow (used directly for plain-array and
+            # view-backed `p`).
+            _dp_dense = zero(_p)
+            # #1470-safe parameter shadow: for a SciMLStructures (non-array) `p` the
+            # shadow must be a fully disjoint `make_zero(p)` (NOT
+            # `repack(zero(tunables))`, which aliases `p`'s non-tunable arrays);
+            # re-zeroing a cached aliasing shadow would corrupt the user's `p`.
+            _needs_shadow = !(p isa SciMLBase.NullParameters) &&
+                isscimlstructure(p) && !(p isa AbstractArray)
+            _shadow_p = if _needs_shadow
+                Enzyme.make_zero(p)
+            elseif !(p isa SciMLBase.NullParameters) && p isa AbstractArray &&
+                    typeof(tunables) !== typeof(zero(tunables))
+                # view-backed tunables (e.g. ComponentArray with SubArray data):
+                # pre-allocate a dense primal buffer to match the dense shadow type.
+                EnzymeViewPrimalBuffer(copy(tunables))
+            else
+                nothing
+            end
+            paramjac_noise_config = (
+                du_out = _du_out, du_seed = _du_seed,
+                u_buf = _u_buf, du_u = _du_u,
+                func_shadow = _func_shadow, dp_dense = _dp_dense,
+                shadow_p = _shadow_p,
+            )
         elseif autojacvec isa Bool
             if isinplace
-                if StochasticDiffEq.is_diagonal_noise(prob)
-                    pf = DiffEqBase.ParamJacobianWrapper(unwrappedf, _t, y)
+                if SciMLBase.is_diagonal_noise(prob)
+                    pf = SciMLBase.ParamJacobianWrapper(unwrappedf, _t, y)
                     if isnoisemixing(sensealg)
-                        uf = DiffEqBase.UJacobianWrapper(unwrappedf, _t, p)
+                        uf = SciMLBase.UJacobianWrapper(unwrappedf, _t, p)
                         jac_noise_config = build_jac_config(sensealg, uf, u0)
                     else
                         jac_noise_config = nothing
                     end
                 else
-                    pf = ParamNonDiagNoiseJacobianWrapper(unwrappedf, _t, y,
-                                                          prob.noise_rate_prototype)
-                    uf = UNonDiagNoiseJacobianWrapper(unwrappedf, _t, p,
-                                                      prob.noise_rate_prototype)
+                    pf = ParamNonDiagNoiseJacobianWrapper(
+                        unwrappedf, _t, y,
+                        prob.noise_rate_prototype
+                    )
+                    uf = UNonDiagNoiseJacobianWrapper(
+                        unwrappedf, _t, p,
+                        prob.noise_rate_prototype
+                    )
                     jac_noise_config = build_jac_config(sensealg, uf, u0)
                 end
-                paramjac_noise_config = build_param_jac_config(sensealg, pf, y, p)
+                paramjac_noise_config = build_param_jac_config(
+                    sensealg, pf, y, SciMLStructures.replace(Tunable(), p, tunables)
+                )
             else
-                if StochasticDiffEq.is_diagonal_noise(prob)
+                if SciMLBase.is_diagonal_noise(prob)
                     pf = ParamGradientWrapper(unwrappedf, _t, y)
                     if isnoisemixing(sensealg)
-                        uf = DiffEqBase.UDerivativeWrapper(unwrappedf, _t, p)
+                        uf = SciMLBase.UDerivativeWrapper(unwrappedf, _t, p)
                     end
                 else
                     pf = ParamNonDiagNoiseGradientWrapper(unwrappedf, _t, y)
@@ -326,14 +584,18 @@ function adjointdiffcache(g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f
                 paramjac_noise_config = nothing
                 jac_noise_config = nothing
             end
-            if StochasticDiffEq.is_diagonal_noise(prob)
+            if SciMLBase.is_diagonal_noise(prob)
                 pJ = similar(u0, numindvar, numparams)
                 if isnoisemixing(sensealg)
                     J = similar(u0, numindvar, numindvar)
                 end
+                pJ .= false
+                J .= false
             else
                 pJ = similar(u0, numindvar * numindvar, numparams)
                 J = similar(u0, numindvar * numindvar, numindvar)
+                pJ .= false
+                J .= false
             end
 
         else
@@ -345,31 +607,85 @@ function adjointdiffcache(g::G, sensealg, discrete, sol, dgdu::DG1, dgdp::DG2, f
         jac_noise_config = nothing
     end
 
-    adjoint_cache = AdjointDiffCache(uf, pf, pg, J, pJ, dg_val,
-                                     jac_config, pg_config, paramjac_config,
-                                     jac_noise_config, paramjac_noise_config,
-                                     f_cache, dgdu, dgdp, diffvar_idxs, algevar_idxs,
-                                     factorized_mass_matrix, issemiexplicitdae)
+    adjoint_cache = AdjointDiffCache(
+        uf, pf, pg, J, pJ, dg_val,
+        jac_config, pg_config, paramjac_config,
+        jac_noise_config, paramjac_noise_config,
+        f_cache, dgdu, dgdp, diffvar_idxs, algevar_idxs,
+        factorized_mass_matrix, issemiexplicitdae,
+        tunables, repack,
+        algeeq_idxs, diffeq_idxs, isDAE, index2
+    )
 
     return adjoint_cache, y
 end
 
-function get_paramjac_config(autojacvec::ReverseDiffVJP, p, f, y, _p, _t;
-                             numindvar = nothing, alg = nothing, isinplace = true,
-                             isRODE = false, _W = nothing)
+# ReverseDiff tape for the fully implicit DAE residual F(du, u, p, t), taped over
+# all four arguments so a single reverse pass yields the vjps with respect to
+# `du`, `u`, and `p`.
+function get_dae_paramjac_config(
+        autojacvec::ReverseDiffVJP, p, f, y, dy, _p, _t;
+        isinplace = true
+    )
+    if p === nothing || p isa SciMLBase.NullParameters
+        tunables, repack = p, identity
+    elseif isscimlstructure(p)
+        tunables, repack, _ = canonicalize(Tunable(), p)
+    else
+        tunables, repack = p, identity
+    end
+    tape = if isinplace
+        ReverseDiff.GradientTape((dy, y, _p, [_t])) do du, u, p, t
+            res = (p !== nothing && p !== SciMLBase.NullParameters()) ?
+                similar(p, size(u)) : similar(u)
+            res .= false
+            f(res, du, u, repack(p), first(t))
+            return vec(res)
+        end
+    else
+        ReverseDiff.GradientTape((dy, y, _p, [_t])) do du, u, p, t
+            vec(f(du, u, repack(p), first(t)))
+        end
+    end
+    if compile_tape(autojacvec)
+        return ReverseDiff.compile(tape)
+    else
+        return tape
+    end
+end
+
+function get_paramjac_config(
+        autojacvec::ReverseDiffVJP, p, f, y, _p, _t;
+        numindvar = nothing, alg = nothing, isinplace = true,
+        isRODE = false, _W = nothing
+    )
     # f = unwrappedf
+    if p === nothing || p isa SciMLBase.NullParameters
+        tunables, repack = p, identity
+    elseif isscimlstructure(p)
+        tunables, repack, _ = canonicalize(Tunable(), p)
+    elseif isfunctor(p)
+        error(
+            "ReverseDiffVJP does not support Functors.jl parameter structs. " *
+                "Use ZygoteVJP() instead or make `p` a SciMLStructure. See SciMLStructures.jl."
+        )
+    else
+        tunables, repack = p, identity
+    end
     if isinplace
         if !isRODE
             tape = ReverseDiff.GradientTape((y, _p, [_t])) do u, p, t
-                du1 = (p !== nothing && p !== DiffEqBase.NullParameters()) ?
-                      similar(p, size(u)) : similar(u)
-                f(du1, u, p, first(t))
+                du1 = (p !== nothing && p !== SciMLBase.NullParameters()) ?
+                    similar(p, size(u)) : similar(u)
+                du1 .= false
+                f(du1, u, repack(p), first(t))
                 return vec(du1)
             end
         else
             tape = ReverseDiff.GradientTape((y, _p, [_t], _W)) do u, p, t, W
-                du1 = p !== nothing && p !== DiffEqBase.NullParameters() ?
-                      similar(p, size(u)) : similar(u)
+                du1 = p !== nothing && p !== SciMLBase.NullParameters() ?
+                    similar(p, size(u)) : similar(u)
+                du1 .= false
                 f(du1, u, p, first(t), W)
                 return vec(du1)
             end
@@ -377,7 +693,7 @@ function get_paramjac_config(autojacvec::ReverseDiffVJP, p, f, y, _p, _t;
     else
         if !isRODE
             tape = ReverseDiff.GradientTape((y, _p, [_t])) do u, p, t
-                vec(f(u, p, first(t)))
+                vec(f(u, repack(p), first(t)))
             end
         else
             tape = ReverseDiff.GradientTape((y, _p, [_t], _W)) do u, p, t, W
@@ -395,10 +711,12 @@ function get_paramjac_config(autojacvec::ReverseDiffVJP, p, f, y, _p, _t;
     return paramjac_config
 end
 
-function get_paramjac_config(autojacvec::EnzymeVJP, p::DiffEqBase.NullParameters, f, y, _p,
-                             _t;
-                             numindvar, alg, isinplace = nothing, isRODE = nothing,
-                             _W = nothing)
+function get_paramjac_config(
+        autojacvec::EnzymeVJP, p::SciMLBase.NullParameters, f, y, _p,
+        _t;
+        numindvar, alg, isinplace = nothing, isRODE = nothing,
+        _W = nothing
+    )
     if alg !== nothing && SciMLBase.forwarddiffs_model(alg)
         chunk = if autojacvec.chunksize == 0
             ForwardDiff.pickchunksize(numindvar)
@@ -406,18 +724,21 @@ function get_paramjac_config(autojacvec::EnzymeVJP, p::DiffEqBase.NullParameters
             autojacvec.chunksize
         end
 
-        paramjac_config = dualcache(zero(y), chunk), p,
-                          dualcache(zero(y), chunk),
-                          dualcache(zero(y), chunk)
+        paramjac_config = LazyBufferCache(), p,
+            LazyBufferCache(),
+            LazyBufferCache(),
+            LazyBufferCache()
     else
-        paramjac_config = zero(y), p, zero(y), zero(y)
+        paramjac_config = zero(y), p, zero(y), zero(y), zero(y)
     end
     return paramjac_config
 end
 
-function get_paramjac_config(autojacvec::EnzymeVJP, p, f, y, _p, _t; numindvar, alg,
-                             isinplace = nothing,
-                             isRODE = nothing, _W = nothing)
+function get_paramjac_config(
+        autojacvec::EnzymeVJP, p, f, y, _p, _t; numindvar, alg,
+        isinplace = nothing,
+        isRODE = nothing, _W = nothing
+    )
     if alg !== nothing && SciMLBase.forwarddiffs_model(alg)
         chunk = if autojacvec.chunksize == 0
             ForwardDiff.pickchunksize(numindvar)
@@ -425,56 +746,332 @@ function get_paramjac_config(autojacvec::EnzymeVJP, p, f, y, _p, _t; numindvar, 
             autojacvec.chunksize
         end
 
-        paramjac_config = dualcache(zero(y), chunk),
-                          zero(_p),
-                          dualcache(zero(y), chunk),
-                          dualcache(zero(y), chunk)
+        paramjac_config = LazyBufferCache(), zero(_p),
+            LazyBufferCache(),
+            LazyBufferCache(),
+            LazyBufferCache()
     else
-        paramjac_config = zero(y), zero(_p), zero(y), zero(y)
+        paramjac_config = zero(y), zero(_p), zero(y), zero(y), zero(y)
     end
     return paramjac_config
 end
 
-function get_pf(autojacvec::ReverseDiffVJP; _f = nothing, isinplace = nothing,
-                isRODE = nothing)
-    nothing
+# Dispatched on inside extension.
+struct MooncakeLoaded end
+struct ReactantLoaded end
+"""
+    ReactantDualTag
+
+Tag type used by the Reactant extension to distinguish dual-number compilation
+paths from floating-point compilation paths.
+
+This is developer API for `SciMLSensitivityReactantExt` and related extension
+code.
+"""
+struct ReactantDualTag end
+
+"""
+    ReactantVJPConfig
+
+Compiled-kernel cache used by `ReactantVJP`.
+
+## Fields
+
+  - `float_kernel`, `dual_kernel`: Reactant-compiled kernels for ordinary and
+    dual-number execution.
+  - `float_caches`, `dual_caches`: buffers reused by the corresponding kernels.
+  - `is_nullparams`: whether the differentiated problem has null parameters.
+  - `chunk_size`: ForwardDiff chunk size used when dual execution is required.
+
+This is developer API for the Reactant extension; users normally configure it
+through `ReactantVJP`.
+"""
+struct ReactantVJPConfig{FK, DK, FC, DC}
+    float_kernel::FK
+    dual_kernel::DK
+    float_caches::FC
+    dual_caches::DC
+    is_nullparams::Bool
+    chunk_size::Int
+end
+
+function get_paramjac_config(::Any, ::MooncakeVJP, pf, p, f, y, _t)
+    msg = "MooncakeVJP requires Mooncake.jl is loaded. Install the package and do " * "`using Mooncake` to use this functionality"
+    error(msg)
+end
+
+function get_paramjac_config(
+        ::Any, ::ReactantVJP, pf, p, f, y, _t;
+        numindvar = nothing, alg = nothing
+    )
+    msg = "ReactantVJP requires Reactant.jl is loaded. Install the package and do " *
+        "`using Reactant` to use this functionality"
+    error(msg)
+end
+
+function get_pf(
+        autojacvec::ReverseDiffVJP; _f = nothing, isinplace = nothing,
+        isRODE = nothing
+    )
+    return nothing
+end
+
+"""
+    enzyme_rhs(f)
+
+The function the Enzyme VJPs differentiate. They only ever *call* the right-hand
+side, so for an `ODEFunction` this is the bare user function rather than the
+container. The container also carries `sys`, `observed`, `initialization_data`,
+... which Enzyme cannot prove derivative-free (e.g. the `Dict{SymbolicT, SymbolicT}`
+maps in ModelingToolkit's `InitializationMetadata`), so differentiating it means
+allocating a shadow of all of that and `remake_zero!`-ing it on every VJP call:
+for an MTK-generated 32-state linear ODE ~190 µs per call against a ~5 ns rhs,
+making `GaussAdjoint(EnzymeVJP)` gradients ~8x slower than necessary.
+`DAEFunction`s already get this treatment through `dae_unwrapped_f`.
+
+An `ODEFunction` whose `f.f` is an `AbstractSciMLOperator` is kept whole: its call
+`f(du, u, p, t)` forwards as `f.f(du, u, u, p, t)`, which the bare operator would not.
+
+Contract: the shadow is built at configuration time and the primal at call time,
+in different places (`adjointdiffcache`/`_vecjacobian!`, the Gauss and Quadrature
+integrands). Both sides must go through `enzyme_rhs` so `Duplicated(primal, shadow)`
+sees matching types; any new method here has to be audited against every such pair.
+"""
+enzyme_rhs(f) = unwrapped_f(f)
+function enzyme_rhs(f::ODEFunction)
+    f.f isa SciMLOperators.AbstractSciMLOperator && return unwrapped_f(f)
+    return unwrapped_f(f.f)
 end
 
 function get_pf(autojacvec::EnzymeVJP; _f, isinplace, isRODE)
-    pf = let f = _f
+    return isinplace ? SciMLBase.Void(_f) : _f
+end
+
+function get_pf(::MooncakeVJP, prob, _f)
+    isinplace = DiffEqBase.isinplace(prob)
+    isRODE = isa(prob, RODEProblem)
+    return pf = let f = _f
         if isinplace && isRODE
             function (out, u, _p, t, W)
                 f(out, u, _p, t, W)
-                nothing
+                return out
             end
         elseif isinplace
             function (out, u, _p, t)
                 f(out, u, _p, t)
-                nothing
+                return out
             end
         elseif !isinplace && isRODE
             function (out, u, _p, t, W)
                 out .= f(u, _p, t, W)
-                nothing
+                return out
             end
         else
             # !isinplace
             function (out, u, _p, t)
                 out .= f(u, _p, t)
-                nothing
+                return out
             end
         end
     end
 end
 
-function getprob(S::SensitivityFunction)
-    (S isa ODEBacksolveSensitivityFunction) ? S.prob : S.sol.prob
+function mooncake_run_ad(paramjac_config, y, p, t, λ)
+    msg = "MooncakeVJP requires Mooncake.jl is loaded. Install the package and do " * "`using Mooncake` to use this functionality"
+    error(msg)
 end
+
+
+function get_pf(::ReactantVJP, prob, _f)
+    isinplace = DiffEqBase.isinplace(prob)
+    isRODE = isa(prob, RODEProblem)
+    return pf = let f = _f
+        if isinplace && isRODE
+            function (out, u, _p, t, W)
+                f(out, u, _p, t, W)
+                return out
+            end
+        elseif isinplace
+            function (out, u, _p, t)
+                f(out, u, _p, t)
+                return out
+            end
+        elseif !isinplace && isRODE
+            function (out, u, _p, t, W)
+                out .= f(u, _p, t, W)
+                return out
+            end
+        else
+            function (out, u, _p, t)
+                out .= f(u, _p, t)
+                return out
+            end
+        end
+    end
+end
+
+function reactant_run_ad!(dλ, dgrad, dy, paramjac_config, y, p, t, λ)
+    msg = "ReactantVJP requires Reactant.jl is loaded. Install the package and do " *
+        "`using Reactant` to use this functionality"
+    error(msg)
+end
+
+function reactant_run_dual_ad!(dλ, dgrad, dy, config, y, p, t, λ)
+    msg = "ReactantVJP requires Reactant.jl is loaded. Install the package and do " *
+        "`using Reactant` to use this functionality"
+    error(msg)
+end
+
+function reactant_run_cb_ad!(dλ, dgrad, dy, paramjac_config, y, p, t, tprev, λ)
+    msg = "ReactantVJP requires Reactant.jl is loaded. Install the package and do " *
+        "`using Reactant` to use this functionality"
+    error(msg)
+end
+
+function get_cb_paramjac_config(::Any, ::ReactantVJP, raw_affect, event_idx, y, p, _t, mode)
+    msg = "ReactantVJP requires Reactant.jl is loaded. Install the package and do " *
+        "`using Reactant` to use this functionality"
+    error(msg)
+end
+
+function get_cb_paramjac_config(::Any, ::MooncakeVJP, raw_affect, event_idx, y, p, _t, mode)
+    msg = "MooncakeVJP requires Mooncake.jl is loaded. Install the package and do " *
+        "`using Mooncake` to use this functionality"
+    error(msg)
+end
+
+"""
+    getprob(S::SensitivityFunction)
+
+Return the originating SciML problem used to construct `S`.
+
+The default method handles the built-in backsolve layout, which stores the
+problem in `S.prob`, and the other built-in layouts, which store it in
+`S.sol.prob`.
+
+# Arguments
+
+  - `S::SensitivityFunction`: Sensitivity-function subtype whose originating
+    problem should be returned.
+
+# Returns
+
+  - The originating SciML problem used to determine model metadata and calling
+    conventions.
+
+# Extension Rules
+
+A developer-defined subtype with a different storage layout must add a method
+of the form `SciMLSensitivity.getprob(S::MySensitivityFunction)`. The method
+must return the exact originating problem, because derivative wrappers use its
+in-place convention and problem metadata.
+"""
+function getprob(S::SensitivityFunction)
+    return (S isa ODEBacksolveSensitivityFunction) ? S.prob : S.sol.prob
+end
+
+"""
+    inplace_sensitivity(S::SensitivityFunction) -> Bool
+
+Return whether the sensitivity function uses the in-place differential-equation
+calling convention.
+
+The default delegates to `SciMLBase.isinplace(getprob(S))`. Override this method
+only when a developer-defined subtype intentionally uses a calling convention
+different from that of its originating problem. An in-place subtype must accept
+`(du, u, p, t)` and return `nothing`; an out-of-place subtype must accept
+`(u, p, t)` and return the complete derivative.
+
+# Arguments
+
+  - `S::SensitivityFunction`: Sensitivity-function subtype whose calling
+    convention should be reported.
+
+# Returns
+
+  - `Bool`: `true` for an in-place sensitivity function and `false` for an
+    out-of-place sensitivity function.
+"""
 inplace_sensitivity(S::SensitivityFunction) = isinplace(getprob(S))
 
-struct ReverseLossCallback{λType, timeType, yType, RefType, FMType, AlgType, dg1Type,
-                           dg2Type,
-                           cacheType, fType, solType, ΔλasType}
+"""
+    build_adjoint_jac(sol, sensealg, alg, f, tspan)
+
+Construct a `jac(J_adj, λ, p, t)` for the adjoint ODE of the state-only adjoint
+methods (`GaussAdjoint`, `QuadratureAdjoint`, whose adjoint state is just `λ`).
+The adjoint rhs `-(∂f/∂u)ᵀλ` is linear in `λ`, so its Jacobian is exactly
+`-(∂f/∂u)ᵀ` evaluated at the interpolated forward solution — independent of `λ`.
+
+When the user supplies an analytical `jac` (with a `jac_prototype`), evaluate it
+at `y(t)` and negate-transpose. Otherwise, for dense in-place ODEs solved by a
+ForwardDiff-based implicit method, fall back to differentiating the *forward*
+rhs (ForwardDiff/FiniteDiff per `sensealg`'s `autodiff` setting) and
+negate-transposing. Without this, the implicit adjoint solver differentiates the
+vjp-based adjoint rhs itself, which costs a full vjp (plus a forward-solution
+interpolation) per Jacobian column — and with `ReverseDiffVJP` re-records the
+tape with `Dual` numbers on every Jacobian evaluation.
+
+Returns `nothing` when no cheap exact Jacobian can be built; the adjoint solver
+then falls back to its own AD/FD of the adjoint rhs.
+"""
+function build_adjoint_jac(sol, sensealg, alg, f, tspan)
+    jac_prototype = sol.prob.f.jac_prototype
+    u0 = state_values(sol.prob)
+    if SciMLBase.has_jac(sol.prob.f) && jac_prototype !== nothing
+        _fwd_jac_cache = copy(jac_prototype)
+        _fwd_jac_fn = sol.prob.f.jac
+        _fwd_sol = sol
+        if jac_prototype isa SparseArrays.AbstractSparseMatrixCSC
+            return function (J_adj, _λ, _p, _t)
+                _y = _fwd_sol(_t, continuity = :right)
+                _fwd_jac_fn(_fwd_jac_cache, _y, _p, _t)
+                SparseArrays.ftranspose!(J_adj, _fwd_jac_cache, -)
+                return nothing
+            end
+        else
+            return function (J_adj, _λ, _p, _t)
+                _y = _fwd_sol(_t, continuity = :right)
+                _fwd_jac_fn(_fwd_jac_cache, _y, _p, _t)
+                transpose!(J_adj, _fwd_jac_cache)
+                lmul!(-1, J_adj)
+                return nothing
+            end
+        end
+    elseif jac_prototype === nothing && alg !== nothing &&
+            SciMLBase.forwarddiffs_model(alg) &&
+            SciMLBase.isinplace(sol.prob) && u0 isa AbstractArray &&
+            ArrayInterface.ismutable(u0) && eltype(u0) <: AbstractFloat
+        # `forwarddiffs_model(alg)` implies the adjoint solver would push `Dual`
+        # numbers through the vjp-based adjoint rhs anyway, so requiring the
+        # forward rhs to be ForwardDiff-compatible here does not narrow support.
+        _fwd_sol = sol
+        _f = unwrapped_f(f)
+        numindvar = length(u0)
+        _J_cache = similar(u0, numindvar, numindvar)
+        _J_cache .= false
+        _uf = SciMLBase.UJacobianWrapper(_f, tspan[2], parameter_values(sol.prob))
+        _jac_config = build_jac_config(sensealg, _uf, u0)
+        _y_cache = similar(u0)
+        _fx_cache = similar(u0)
+        return function (J_adj, _λ, _p, _t)
+            _fwd_sol(_y_cache, _t, continuity = :right)
+            _uf.t = _t
+            _uf.p = _p
+            jacobian!(_J_cache, _uf, _y_cache, _fx_cache, sensealg, _jac_config)
+            transpose!(J_adj, _J_cache)
+            lmul!(-1, J_adj)
+            return nothing
+        end
+    else
+        return nothing
+    end
+end
+
+struct ReverseLossCallback{
+        λType, timeType, yType, RefType, FMType, AlgType, dg1Type,
+        dg2Type,
+        cacheType, fType, solType, ΔλasType,
+    }
     isq::Bool
     λ::λType
     t::timeType
@@ -489,72 +1086,113 @@ struct ReverseLossCallback{λType, timeType, yType, RefType, FMType, AlgType, dg
     f::fType
     sol::solType
     Δλas::ΔλasType
+    no_start::Bool
 end
 
-function ReverseLossCallback(sensefun, λ, t, dgdu, dgdp, cur_time)
-    @unpack sensealg, y = sensefun
-    isq = (sensealg isa QuadratureAdjoint)
+function ReverseLossCallback(sensefun, λ, t, dgdu, dgdp, cur_time, no_start)
+    (; sensealg, y) = sensefun
+    isq = (sensealg isa QuadratureAdjoint) || (sensealg isa AbstractGAdjoint)
 
-    @unpack factorized_mass_matrix = sensefun.diffcache
+    (; factorized_mass_matrix, isdae) = sensefun.diffcache
     prob = getprob(sensefun)
-    idx = length(prob.u0)
+    idx = length(state_values(prob))
     Δλas = Tuple{typeof(λ), eltype(t)}[]
-    if ArrayInterface.ismutable(y)
-        return ReverseLossCallback(isq, λ, t, y, cur_time, idx, factorized_mass_matrix,
-                                   sensealg, dgdu, dgdp, sensefun.diffcache, sensefun.f,
-                                   nothing, Δλas)
+    if ArrayInterface.ismutable(y) && !isdae
+        return ReverseLossCallback(
+            isq, λ, t, y, cur_time, idx, factorized_mass_matrix,
+            sensealg, dgdu, dgdp, sensefun.diffcache, sensefun.f,
+            nothing, Δλas, no_start
+        )
     else
-        return ReverseLossCallback(isq, λ, t, y, cur_time, idx, factorized_mass_matrix,
-                                   sensealg, dgdu, dgdp, sensefun.diffcache, sensefun.f,
-                                   sensefun.sol, Δλas)
+        # The DAE jump corrections interpolate the forward solution (and its
+        # derivative) at the jump time, so keep `sol` around.
+        return ReverseLossCallback(
+            isq, λ, t, y, cur_time, idx, factorized_mass_matrix,
+            sensealg, dgdu, dgdp, sensefun.diffcache, sensefun.f,
+            sensefun.sol, Δλas, no_start
+        )
     end
 end
 
 function (f::ReverseLossCallback)(integrator)
-    @unpack isq, λ, t, y, cur_time, idx, F, sensealg, dgdu, dgdp, sol = f
-    @unpack diffvar_idxs, algevar_idxs, issemiexplicitdae, J, uf, f_cache, jac_config = f.diffcache
+    (; isq, λ, t, y, cur_time, idx, F, sensealg, dgdu, dgdp, sol, no_start) = f
+    (;
+        diffvar_idxs, algevar_idxs, issemiexplicitdae,
+        J, uf, f_cache, jac_config,
+        algeeq_idxs, diffeq_idxs, isdae, index2,
+    ) = f.diffcache
+
+    no_start && !(sensealg isa BacksolveAdjoint) && cur_time[] == 1 && return nothing
 
     p, u = integrator.p, integrator.u
+    ti = t[cur_time[]]
 
     if sensealg isa BacksolveAdjoint
         copyto!(y, integrator.u[(end - idx + 1):end])
     end
 
+    # For implicit DAEs the shared `y` buffer holds the last rhs evaluation
+    # point, so interpolate the forward solution at the jump time instead.
+    isdae && sol(y, ti)
+
     if ArrayInterface.ismutable(u)
         # Warning: alias here! Be careful with λ
         gᵤ = isq ? λ : @view(λ[1:idx])
         if dgdu !== nothing
-            dgdu(gᵤ, y, p, t[cur_time[]], cur_time[])
-            # add discrete dgdp contribution
+            dgdu(gᵤ, y, p, ti, cur_time[])
+            # add discrete dgdp contribution; for the DAE adjoint the parameter
+            # gradient block sits behind both the w and λ blocks
             if dgdp !== nothing && !isq
+                poff = isdae ? 2 * idx : idx
                 gp = @view(λ[(idx + 1):end])
-                dgdp(gp, y, p, t[cur_time[]], cur_time[])
-                u[(idx + 1):length(λ)] .+= gp
+                dgdp(gp, y, p, ti, cur_time[])
+                u[(poff + 1):(poff + length(gp))] .+= gp
             end
         end
     else
-        @assert sensealg isa QuadratureAdjoint
-        outtype = DiffEqBase.parameterless_type(λ)
-        y = sol(t[cur_time[]])
-        gᵤ = dgdu(y, p, t[cur_time[]], cur_time[]; outtype = outtype)
+        # Immutable (e.g. SVector) state: only valid for adjoints whose state is
+        # exactly λ with no parameter-gradient augmentation.
+        @assert isq
+        outtype = ArrayInterface.parameterless_type(λ)
+        y = sol(ti)
+        gᵤ = dgdu(y, p, ti, cur_time[]; outtype)
     end
 
-    if issemiexplicitdae
-        if J isa DiffCache
-            J = get_tmp(J, y)
-        end
-        if DiffEqBase.has_jac(f.f)
-            f.f.jac(J, y, p, t[cur_time[]])
+    if issemiexplicitdae || (isdae && !isempty(algevar_idxs))
+        if isdae
+            # ∂F/∂u of the residual at the interpolated (du, u); the shared
+            # Jacobian machinery is bypassed since the residual signature differs.
+            dy = sol(ti, Val{1})
+            residual = unwrapped_f(f.f)
+            J_u = dae_u_jacobian(residual, DiffEqBase.isinplace(sol.prob), dy, y, p, ti)
         else
-            jacobian!(J, uf, y, f_cache, sensealg, jac_config)
+            if J isa DiffCache
+                J = get_tmp(J, y)
+            end
+            if SciMLBase.has_jac(f.f)
+                f.f.jac(J, y, p, ti)
+            else
+                jacobian!(J, uf, y, f_cache, sensealg, jac_config)
+            end
+            J_u = J
         end
-        dhdd = J[algevar_idxs, diffvar_idxs]
-        dhda = J[algevar_idxs, algevar_idxs]
-        Δλa = -(dhda' \ gᵤ[algevar_idxs])
+        dhdd = J_u[algeeq_idxs, diffvar_idxs]
+        if isdae && index2
+            all(iszero, @view(gᵤ[algevar_idxs])) ||
+                error("Discrete cost contributions on the algebraic variables of an index-2 DAE are not supported: they correspond to derivatives of delta distributions in the adjoint. Reformulate the cost in terms of the differential variables.")
+            dy = sol(ti, Val{1})
+            residual = unwrapped_f(f.f)
+            J_du = dae_du_jacobian(residual, DiffEqBase.isinplace(sol.prob), dy, y, p, ti)
+            N = (lu(J_du[diffeq_idxs, diffvar_idxs]) \ J_u[diffeq_idxs, algevar_idxs])'
+            Δλa = -((N * dhdd') \ (N * gᵤ[diffvar_idxs]))
+        else
+            dhda = J_u[algeeq_idxs, algevar_idxs]
+            Δλa = -(dhda' \ gᵤ[algevar_idxs])
+        end
         Δλd = dhdd'Δλa + gᵤ[diffvar_idxs]
-        push!(f.Δλas, (Δλa, t[cur_time[]]))
+        push!(f.Δλas, (Δλa, ti))
     else
-        Δλd = gᵤ
+        Δλd = isdae ? gᵤ[diffvar_idxs] : gᵤ
     end
 
     if F !== nothing
@@ -564,21 +1202,23 @@ function (f::ReverseLossCallback)(integrator)
     if ArrayInterface.ismutable(u)
         u[diffvar_idxs] .+= Δλd
     else
-        @assert sensealg isa QuadratureAdjoint
+        @assert isq
         integrator.u += Δλd
     end
-    u_modified!(integrator, true)
+    derivative_discontinuity!(integrator, true)
     cur_time[] -= 1
     return nothing
 end
 
 # handle discrete loss contributions
-function generate_callbacks(sensefun, dgdu, dgdp, λ, t, t0, callback, init_cb,
-                            terminated = false)
+function generate_callbacks(
+        sensefun, dgdu, dgdp, λ, t, t0, callback, init_cb,
+        terminated = false, no_start = false; dgdt_discrete = nothing
+    )
     if sensefun isa NILSASSensitivityFunction
-        @unpack sensealg = sensefun.S
+        (; sensealg) = sensefun.S
     else
-        @unpack sensealg = sensefun
+        (; sensealg) = sensefun
     end
 
     if !init_cb
@@ -587,25 +1227,29 @@ function generate_callbacks(sensefun, dgdu, dgdp, λ, t, t0, callback, init_cb,
         cur_time = Ref(length(t))
     end
 
-    reverse_cbs = setup_reverse_callbacks(callback, sensealg, dgdu, dgdp, cur_time,
-                                          terminated)
+    reverse_cbs = setup_reverse_callbacks(
+        callback, sensealg, dgdu, dgdp, dgdt_discrete, cur_time,
+        terminated
+    )
 
     init_cb || return reverse_cbs, nothing, nothing
 
     # callbacks can lead to non-unique time points
     _t, duplicate_iterator_times = separate_nonunique(t)
 
-    rlcb = ReverseLossCallback(sensefun, λ, t, dgdu, dgdp, cur_time)
+    rlcb = ReverseLossCallback(sensefun, λ, t, dgdu, dgdp, cur_time, no_start)
 
     if eltype(_t) !== typeof(t0)
         _t = convert.(typeof(t0), _t)
     end
     cb = PresetTimeCallback(_t, rlcb)
 
-    # handle duplicates (currently only for double occurances)
+    # handle duplicates (currently only for double occurrences)
     if duplicate_iterator_times !== nothing
         # use same ref for cur_time to cope with concrete_solve
-        cbrev_dupl_affect = ReverseLossCallback(sensefun, λ, t, dgdu, dgdp, cur_time)
+        cbrev_dupl_affect = ReverseLossCallback(
+            sensefun, λ, t, dgdu, dgdp, cur_time, no_start
+        )
         cb_dupl = PresetTimeCallback(duplicate_iterator_times[1], cbrev_dupl_affect)
         return CallbackSet(cb, reverse_cbs, cb_dupl), rlcb, duplicate_iterator_times
     else
@@ -616,22 +1260,22 @@ end
 function separate_nonunique(t)
     # t is already sorted
     _t = unique(t)
-    ts_with_occurances = [(i, count(==(i), t)) for i in _t]
+    ts_with_occurrences = [(i, count(==(i), t)) for i in _t]
 
     # duplicates (only those values which occur > 1 times)
-    dupl = filter(x -> last(x) > 1, ts_with_occurances)
+    dupl = filter(x -> last(x) > 1, ts_with_occurrences)
 
     ts = first.(dupl)
-    occurances = last.(dupl)
+    occurrences = last.(dupl)
 
-    if isempty(occurances)
+    if isempty(occurrences)
         itrs = nothing
     else
-        maxoc = maximum(occurances)
+        maxoc = maximum(occurrences)
         maxoc > 2 &&
-            error("More than two occurances of the same time point. Please report this.")
-        # handle also more than two occurances
-        itrs = [ts[occurances .>= i] for i in 2:maxoc]
+            error("More than two occurrences of the same time point. Please report this.")
+        # handle also more than two occurrences
+        itrs = [ts[occurrences .>= i] for i in 2:maxoc]
     end
 
     return _t, itrs
@@ -644,11 +1288,11 @@ function out_and_ts(_ts, duplicate_iterator_times, sol)
     else
         # if callbacks are tracked, there is potentially an event_time that must be considered
         # in the loss function but doesn't occur in saveat/t. So we need to add it.
-        # Note that if it doens't occur in saveat/t we even need to add it twice
+        # Note that if it doesn't occur in saveat/t we even need to add it twice
         # However if the callbacks are not saving in the forward, we don't want to compute a loss
         # value for them. This information is given by sol.t/checkpoints.
         # Additionally we need to store the left and the right limit, respectively.
-        duplicate_times = duplicate_iterator_times[1] # just treat two occurances at the moment (see separate_nonunique above)
+        duplicate_times = duplicate_iterator_times[1] # just treat two occurrences at the moment (see separate_nonunique above)
         _ts = Array(_ts)
         for d in duplicate_times
             (d ∉ _ts) && push!(_ts, d)

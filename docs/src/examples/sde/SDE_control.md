@@ -1,6 +1,6 @@
 # Controlling Stochastic Differential Equations
 
-In this tutorial, we show how to use DiffEqFlux to control the time evolution of a system
+In this tutorial, we show how to use SciMLSensitivity to control the time evolution of a system
 described by a stochastic differential equation (SDE). Specifically, we consider a
 continuously monitored qubit described by an SDE in the Ito sense with multiplicative
 scalar noise (see [1] for a reference):
@@ -18,14 +18,16 @@ to ultimately prepare and stabilize the qubit in the excited state.
 Before getting to the explanation, here's some code to start with. We will
 follow a full explanation of the definition and training process:
 
+
 ```@example
 # load packages
-using DiffEqFlux
-using SciMLSensitivity
-using Optimization
-using StochasticDiffEq, DiffEqCallbacks, DiffEqNoiseProcess
-using Statistics, LinearAlgebra, Random
-using Plots
+import SciMLSensitivity as SMS, Optimization as OPT, OptimizationOptimisers as OPO
+import StochasticDiffEq as SDE, DiffEqCallbacks as DEC, DiffEqNoiseProcess as DNP
+import Statistics, LinearAlgebra as LA, Random
+import Lux, Random, ComponentArrays as CA
+import Plots
+
+rng = Random.default_rng()
 
 #################################################
 lr = 0.01f0
@@ -67,19 +69,20 @@ struct Parameters{flType, intType, tType}
 end
 
 myparameters = Parameters{typeof(dt), typeof(numtraj), typeof(tspan)}(lr, epochs, numtraj,
-                                                                      numtrajplot, dt,
-                                                                      tinterval, tspan,
-                                                                      Nintervals, ts,
-                                                                      Δ, Ωmax, κ, C1)
+    numtrajplot, dt,
+    tinterval, tspan,
+    Nintervals, ts,
+    Δ, Ωmax, κ, C1)
 
 ################################################
 # Define Neural Network
 
 # state-aware
-nn = FastChain(FastDense(4, 32, relu),
-               FastDense(32, 1, tanh))
+nn = Lux.Chain(Lux.Dense(4, 32, Lux.relu),
+    Lux.Dense(32, 1, tanh))
 
-p_nn = initial_params(nn) # random initial parameters
+p_nn, st = Lux.setup(rng, nn)
+p_nn = CA.ComponentArray(p_nn)
 
 ###############################################
 # initial state anywhere on the Bloch sphere
@@ -94,7 +97,7 @@ function prepare_initial(dt, n_par)
         cos.(theta / 2),
         sin.(theta / 2) .* cos.(phi),
         false * theta,
-        sin.(theta / 2) .* sin.(phi),
+        sin.(theta / 2) .* sin.(phi)
     ]
     return vcat(transpose.(u0)...) # build matrix
 end
@@ -114,9 +117,9 @@ function qubit_drift!(du, u, p, t)
     # Δ: atomic frequency
     # Ω: Rabi frequency for field in x direction
     # κ: spontaneous emission
-    Δ, Ωmax, κ = p[(end - 2):end]
-    nn_weights = p[1:(end - 3)]
-    Ω = (nn(u, nn_weights) .* Ωmax)[1]
+    Δ, Ωmax, κ = p.myparameters
+    nn_weights = p.p_nn
+    Ω = (nn(u, nn_weights, st)[1] .* Ωmax)[1]
 
     @inbounds begin
         du[1] = 1 // 2 * (ceI * Δ - ceR * κ + cdI * Ω)
@@ -130,7 +133,7 @@ end
 function qubit_diffusion!(du, u, p, t)
     ceR, cdR, ceI, cdI = u # real and imaginary parts
 
-    κ = p[end]
+    κ = p.myparameters[end]
 
     du .= false
 
@@ -146,24 +149,23 @@ end
 # normalization callback
 condition(u, t, integrator) = true
 function affect!(integrator)
-    integrator.u .= integrator.u / norm(integrator.u)
+    integrator.u .= integrator.u / LA.norm(integrator.u)
 end
-callback = DiscreteCallback(condition, affect!, save_positions = (false, false))
-
-CreateGrid(t, W1) = NoiseGrid(t, W1)
-Zygote.@nograd CreateGrid #avoid taking grads of this function
+callback = DEC.DiscreteCallback(condition, affect!, save_positions = (false, false))
 
 # set scalar random process
 W = sqrt(myparameters.dt) * randn(typeof(myparameters.dt), size(myparameters.ts)) #for 1 trajectory
 W1 = cumsum([zero(myparameters.dt); W[1:(end - 1)]], dims = 1)
-NG = CreateGrid(myparameters.ts, W1)
+NG = DNP.NoiseGrid(myparameters.ts, W1)
 
 # get control pulses
-p_all = [p_nn; myparameters.Δ; myparameters.Ωmax; myparameters.κ]
+p_all = CA.ComponentArray(; p_nn,
+    myparameters = [myparameters.Δ, myparameters.Ωmax, myparameters.κ])
 # define SDE problem
-prob = SDEProblem{true}(qubit_drift!, qubit_diffusion!, vec(u0[:, 1]), myparameters.tspan,
-                        p_all,
-                        callback = callback, noise = NG)
+prob = SDE.SDEProblem{true}(
+    qubit_drift!, qubit_diffusion!, vec(u0[:, 1]), myparameters.tspan,
+    p_all;
+    callback, noise = NG)
 
 #########################################
 # compute loss
@@ -172,37 +174,33 @@ function g(u, p, t)
     cdR = @view u[2, :, :]
     ceI = @view u[3, :, :]
     cdI = @view u[4, :, :]
-    p[1] * mean((cdR .^ 2 + cdI .^ 2) ./ (ceR .^ 2 + cdR .^ 2 + ceI .^ 2 + cdI .^ 2))
+    p[1] *
+    Statistics.mean((cdR .^ 2 + cdI .^ 2) ./ (ceR .^ 2 + cdR .^ 2 + ceI .^ 2 + cdI .^ 2))
 end
 
-function loss(p; alg = EM(), sensealg = BacksolveAdjoint(autojacvec = ReverseDiffVJP()))
-    pars = [p; myparameters.Δ; myparameters.Ωmax; myparameters.κ]
+function loss(p_nn; alg = SDE.EM(), sensealg = SMS.BacksolveAdjoint(autojacvec = SMS.ReverseDiffVJP()))
+    pars = CA.ComponentArray(; p_nn,
+        myparameters = [myparameters.Δ, myparameters.Ωmax, myparameters.κ])
     u0 = prepare_initial(myparameters.dt, myparameters.numtraj)
 
-    function prob_func(prob, i, repeat)
+    function prob_func(prob, ctx)
         # prepare initial state and applied control pulse
-        u0tmp = deepcopy(vec(u0[:, i]))
+        u0tmp = deepcopy(vec(u0[:, ctx.sim_id]))
         W = sqrt(myparameters.dt) * randn(typeof(myparameters.dt), size(myparameters.ts)) #for 1 trajectory
         W1 = cumsum([zero(myparameters.dt); W[1:(end - 1)]], dims = 1)
-        NG = CreateGrid(myparameters.ts, W1)
-
-        remake(prob,
-               p = pars,
-               u0 = u0tmp,
-               callback = callback,
-               noise = NG)
+        NG = DNP.NoiseGrid(myparameters.ts, W1)
+        SDE.remake(prob; u0 = u0tmp, callback, noise = NG)
     end
+    _prob = SDE.remake(prob, p = pars)
 
-    ensembleprob = EnsembleProblem(prob,
-                                   prob_func = prob_func,
-                                   safetycopy = true)
+    ensembleprob = SDE.EnsembleProblem(_prob; prob_func, safetycopy = true)
 
-    _sol = solve(ensembleprob, alg, EnsembleThreads(),
-                 sensealg = sensealg,
-                 saveat = myparameters.tinterval,
-                 dt = myparameters.dt,
-                 adaptive = false,
-                 trajectories = myparameters.numtraj, batch_size = myparameters.numtraj)
+    _sol = SDE.solve(ensembleprob, alg, SDE.EnsembleSerial();
+        sensealg,
+        saveat = myparameters.tinterval,
+        myparameters.dt,
+        adaptive = false,
+        trajectories = myparameters.numtraj, batch_size = myparameters.numtraj)
     A = convert(Array, _sol)
 
     l = g(A, [myparameters.C1], nothing)
@@ -212,67 +210,62 @@ end
 
 #########################################
 # visualization -- run for new batch
-function visualize(p; alg = EM())
+function visualize(p_nn; alg = SDE.EM())
     u0 = prepare_initial(myparameters.dt, myparameters.numtrajplot)
-    pars = [p; myparameters.Δ; myparameters.Ωmax; myparameters.κ]
+    pars = CA.ComponentArray(; p_nn,
+        myparameters = [myparameters.Δ, myparameters.Ωmax, myparameters.κ])
 
-    function prob_func(prob, i, repeat)
+    function prob_func(prob, ctx)
         # prepare initial state and applied control pulse
-        u0tmp = deepcopy(vec(u0[:, i]))
+        u0tmp = deepcopy(vec(u0[:, ctx.sim_id]))
         W = sqrt(myparameters.dt) * randn(typeof(myparameters.dt), size(myparameters.ts)) #for 1 trajectory
         W1 = cumsum([zero(myparameters.dt); W[1:(end - 1)]], dims = 1)
-        NG = CreateGrid(myparameters.ts, W1)
+        NG = DNP.NoiseGrid(myparameters.ts, W1)
 
-        remake(prob,
-               p = pars,
-               u0 = u0tmp,
-               callback = callback,
-               noise = NG)
+        SDE.remake(prob; p = pars, u0 = u0tmp, callback, noise = NG)
     end
 
-    ensembleprob = EnsembleProblem(prob,
-                                   prob_func = prob_func,
-                                   safetycopy = true)
+    ensembleprob = SDE.EnsembleProblem(prob; prob_func, safetycopy = true)
 
-    u = solve(ensembleprob, alg, EnsembleThreads(),
-              saveat = myparameters.tinterval,
-              dt = myparameters.dt,
-              adaptive = false, #abstol=1e-6, reltol=1e-6,
-              trajectories = myparameters.numtrajplot,
-              batch_size = myparameters.numtrajplot)
+    u = SDE.solve(ensembleprob, alg, SDE.EnsembleThreads();
+        saveat = myparameters.tinterval,
+        myparameters.dt,
+        adaptive = false, #abstol=1e-6, reltol=1e-6,
+        trajectories = myparameters.numtrajplot,
+        batch_size = myparameters.numtrajplot)
 
     ceR = @view u[1, :, :]
     cdR = @view u[2, :, :]
     ceI = @view u[3, :, :]
     cdI = @view u[4, :, :]
     infidelity = @. (cdR^2 + cdI^2) / (ceR^2 + cdR^2 + ceI^2 + cdI^2)
-    meaninfidelity = mean(infidelity)
+    meaninfidelity = Statistics.mean(infidelity)
     loss = myparameters.C1 * meaninfidelity
 
     @info "Loss: " loss
 
     fidelity = @. (ceR^2 + ceI^2) / (ceR^2 + cdR^2 + ceI^2 + cdI^2)
 
-    mf = mean(fidelity, dims = 2)[:]
-    sf = std(fidelity, dims = 2)[:]
+    mf = Statistics.mean(fidelity, dims = 2)[:]
+    sf = Statistics.std(fidelity, dims = 2)[:]
 
-    pl1 = plot(0:(myparameters.Nintervals), mf,
-               ribbon = sf,
-               ylim = (0, 1), xlim = (0, myparameters.Nintervals),
-               c = 1, lw = 1.5, xlabel = "steps i", ylabel = "Fidelity", legend = false)
+    pl1 = Plots.plot(0:(myparameters.Nintervals), mf,
+        ribbon = sf,
+        ylim = (0, 1), xlim = (0, myparameters.Nintervals),
+        c = 1, lw = 1.5, xlabel = "steps i", ylabel = "Fidelity", legend = false)
 
-    pl = plot(pl1, legend = false, size = (400, 360))
+    pl = Plots.plot(pl1, legend = false, size = (400, 360))
     return pl, loss
 end
 
 # burn-in loss
 l = loss(p_nn)
 # callback to visualize training
-visualization_callback = function (p, l; doplot = false)
+visualization_callback = function (state, l; doplot = false)
     println(l)
 
     if doplot
-        pl, _ = visualize(p)
+        pl, _ = visualize(state.u)
         display(pl)
     end
 
@@ -280,23 +273,24 @@ visualization_callback = function (p, l; doplot = false)
 end
 
 # Display the ODE with the initial parameter values.
-visualization_callback(p_nn, l; doplot = true)
+visualization_callback((; u = p_nn), l; doplot = true)
 
 ###################################
 # training loop
 @info "Start Training.."
 
-# optimize the parameters for a few epochs with ADAM on time span
+# optimize the parameters for a few epochs with Adam on time span
 # Setup and run the optimization
-adtype = Optimization.AutoZygote()
-optf = Optimization.OptimizationFunction((x, p) -> loss(x), adtype)
+adtype = OPT.AutoForwardDiff()
+optf = OPT.OptimizationFunction((x, p) -> loss(x), adtype)
 
-optprob = Optimization.OptimizationProblem(optf, p_nn)
-res = Optimization.solve(optprob, ADAM(myparameters.lr), callback = visualization_callback,
-                         maxiters = 100)
+optprob = OPT.OptimizationProblem(optf, p_nn)
+res = OPT.solve(optprob, OPO.Adam(myparameters.lr),
+    callback = visualization_callback,
+    maxiters = 100)
 
 # plot optimized control
-visualization_callback(res.u, loss(res.u); doplot = true)
+visualization_callback(res, loss(res.u); doplot = true)
 ```
 
 ## Step-by-step description
@@ -304,12 +298,12 @@ visualization_callback(res.u, loss(res.u); doplot = true)
 ### Load packages
 
 ```@example sdecontrol
-using DiffEqFlux
-using SciMLSensitivity
-using Optimization
-using StochasticDiffEq, DiffEqCallbacks, DiffEqNoiseProcess
-using Statistics, LinearAlgebra, Random
-using Plots
+import SciMLSensitivity as SMS
+import Optimization as OPT, OptimizationOptimisers as OPO
+import StochasticDiffEq as SDE, DiffEqCallbacks as DEC, DiffEqNoiseProcess as DNP
+import Statistics, LinearAlgebra as LA
+import Lux, Random, ComponentArrays as CA
+import Plots
 ```
 
 ### Parameters
@@ -322,6 +316,8 @@ epochs = 100
 
 numtraj = 16 # number of trajectories in parallel simulations for training
 numtrajplot = 32 # .. for plotting
+
+rng = Random.default_rng()
 
 # time range for the solver
 dt = 0.0005f0
@@ -356,10 +352,10 @@ struct Parameters{flType, intType, tType}
 end
 
 myparameters = Parameters{typeof(dt), typeof(numtraj), typeof(tspan)}(lr, epochs, numtraj,
-                                                                      numtrajplot, dt,
-                                                                      tinterval, tspan,
-                                                                      Nintervals, ts,
-                                                                      Δ, Ωmax, κ, C1)
+    numtrajplot, dt,
+    tinterval, tspan,
+    Nintervals, ts,
+    Δ, Ωmax, κ, C1)
 ```
 
 In plain terms, the quantities that were defined are:
@@ -381,14 +377,16 @@ In plain terms, the quantities that were defined are:
 ### Controller
 
 We use a neural network to control the parameter Ω(t). Alternatively, one could
-also, e.g., use [tensor layers](https://docs.sciml.ai/DiffEqFlux/stable/layers/TensorLayer/), Flux.jl, or Lux.jl.
+also, e.g., use polynomials, interpolations, etc. but we use a neural network to demonstrate
+coolness factor and complexity.
 
 ```@example sdecontrol
 # state-aware
-nn = FastChain(FastDense(4, 32, relu),
-               FastDense(32, 1, tanh))
+nn = Lux.Chain(Lux.Dense(4, 32, Lux.relu),
+    Lux.Dense(32, 1, tanh))
 
-p_nn = initial_params(nn) # random initial parameters
+p_nn, st = Lux.setup(rng, nn)
+p_nn = CA.ComponentArray(p_nn)
 ```
 
 ### Initial state
@@ -415,7 +413,7 @@ function prepare_initial(dt, n_par)
         cos.(theta / 2),
         sin.(theta / 2) .* cos.(phi),
         false * theta,
-        sin.(theta / 2) .* sin.(phi),
+        sin.(theta / 2) .* sin.(phi)
     ]
     return vcat(transpose.(u0)...) # build matrix
 end
@@ -445,9 +443,9 @@ function qubit_drift!(du, u, p, t)
     # Δ: atomic frequency
     # Ω: Rabi frequency for field in x direction
     # κ: spontaneous emission
-    Δ, Ωmax, κ = p[(end - 2):end]
-    nn_weights = p[1:(end - 3)]
-    Ω = (nn(u, nn_weights) .* Ωmax)[1]
+    Δ, Ωmax, κ = p.myparameters
+    nn_weights = p.p_nn
+    Ω = (nn(u, nn_weights, st)[1] .* Ωmax)[1]
 
     @inbounds begin
         du[1] = 1 // 2 * (ceI * Δ - ceR * κ + cdI * Ω)
@@ -477,24 +475,23 @@ end
 # normalization callback
 condition(u, t, integrator) = true
 function affect!(integrator)
-    integrator.u .= integrator.u / norm(integrator.u)
+    integrator.u .= integrator.u / LA.norm(integrator.u)
 end
-callback = DiscreteCallback(condition, affect!, save_positions = (false, false))
-
-CreateGrid(t, W1) = NoiseGrid(t, W1)
-Zygote.@nograd CreateGrid #avoid taking grads of this function
+callback = DEC.DiscreteCallback(condition, affect!, save_positions = (false, false))
 
 # set scalar random process
 W = sqrt(myparameters.dt) * randn(typeof(myparameters.dt), size(myparameters.ts)) #for 1 trajectory
 W1 = cumsum([zero(myparameters.dt); W[1:(end - 1)]], dims = 1)
-NG = CreateGrid(myparameters.ts, W1)
+NG = DNP.NoiseGrid(myparameters.ts, W1)
 
 # get control pulses
-p_all = [p_nn; myparameters.Δ; myparameters.Ωmax; myparameters.κ]
+p_all = CA.ComponentArray(; p_nn,
+    myparameters = [myparameters.Δ; myparameters.Ωmax; myparameters.κ])
 # define SDE problem
-prob = SDEProblem{true}(qubit_drift!, qubit_diffusion!, vec(u0[:, 1]), myparameters.tspan,
-                        p_all,
-                        callback = callback, noise = NG)
+prob = SDE.SDEProblem{true}(
+    qubit_drift!, qubit_diffusion!, vec(u0[:, 1]), myparameters.tspan,
+    p_all;
+    callback, noise = NG)
 ```
 
 ### Compute loss function
@@ -516,37 +513,33 @@ function g(u, p, t)
     cdR = @view u[2, :, :]
     ceI = @view u[3, :, :]
     cdI = @view u[4, :, :]
-    p[1] * mean((cdR .^ 2 + cdI .^ 2) ./ (ceR .^ 2 + cdR .^ 2 + ceI .^ 2 + cdI .^ 2))
+    p[1] *
+    Statistics.mean((cdR .^ 2 + cdI .^ 2) ./ (ceR .^ 2 + cdR .^ 2 + ceI .^ 2 + cdI .^ 2))
 end
 
-function loss(p; alg = EM(), sensealg = BacksolveAdjoint(autojacvec = ReverseDiffVJP()))
-    pars = [p; myparameters.Δ; myparameters.Ωmax; myparameters.κ]
+function loss(p_nn; alg = SDE.EM(), sensealg = SMS.BacksolveAdjoint(autojacvec = SMS.ReverseDiffVJP()))
+    pars = CA.ComponentArray(; p_nn,
+        myparameters = [myparameters.Δ, myparameters.Ωmax, myparameters.κ])
     u0 = prepare_initial(myparameters.dt, myparameters.numtraj)
 
-    function prob_func(prob, i, repeat)
+    function prob_func(prob, ctx)
         # prepare initial state and applied control pulse
-        u0tmp = deepcopy(vec(u0[:, i]))
+        u0tmp = deepcopy(vec(u0[:, ctx.sim_id]))
         W = sqrt(myparameters.dt) * randn(typeof(myparameters.dt), size(myparameters.ts)) #for 1 trajectory
         W1 = cumsum([zero(myparameters.dt); W[1:(end - 1)]], dims = 1)
-        NG = CreateGrid(myparameters.ts, W1)
+        NG = DNP.NoiseGrid(myparameters.ts, W1)
 
-        remake(prob,
-               p = pars,
-               u0 = u0tmp,
-               callback = callback,
-               noise = NG)
+        SDE.remake(prob; p = pars, u0 = u0tmp, callback, noise = NG)
     end
 
-    ensembleprob = EnsembleProblem(prob,
-                                   prob_func = prob_func,
-                                   safetycopy = true)
+    ensembleprob = SDE.EnsembleProblem(prob; prob_func, safetycopy = true)
 
-    _sol = solve(ensembleprob, alg, EnsembleThreads(),
-                 sensealg = sensealg,
-                 saveat = myparameters.tinterval,
-                 dt = myparameters.dt,
-                 adaptive = false,
-                 trajectories = myparameters.numtraj, batch_size = myparameters.numtraj)
+    _sol = SDE.solve(ensembleprob, alg, SDE.EnsembleThreads();
+        sensealg,
+        saveat = myparameters.tinterval,
+        myparameters.dt,
+        adaptive = false,
+        trajectories = myparameters.numtraj, batch_size = myparameters.numtraj)
     A = convert(Array, _sol)
 
     l = g(A, [myparameters.C1], nothing)
@@ -562,64 +555,59 @@ standard deviation of the fidelity of a bunch of trajectories (`myparameters.num
 a function of the time steps at which loss values are computed.
 
 ```@example sdecontrol
-function visualize(p; alg = EM())
+function visualize(p_nn; alg = SDE.EM())
     u0 = prepare_initial(myparameters.dt, myparameters.numtrajplot)
-    pars = [p; myparameters.Δ; myparameters.Ωmax; myparameters.κ]
+    pars = CA.ComponentArray(; p_nn,
+        myparameters = [myparameters.Δ, myparameters.Ωmax, myparameters.κ])
 
-    function prob_func(prob, i, repeat)
+    function prob_func(prob, ctx)
         # prepare initial state and applied control pulse
-        u0tmp = deepcopy(vec(u0[:, i]))
+        u0tmp = deepcopy(vec(u0[:, ctx.sim_id]))
         W = sqrt(myparameters.dt) * randn(typeof(myparameters.dt), size(myparameters.ts)) #for 1 trajectory
         W1 = cumsum([zero(myparameters.dt); W[1:(end - 1)]], dims = 1)
-        NG = CreateGrid(myparameters.ts, W1)
+        NG = DNP.NoiseGrid(myparameters.ts, W1)
 
-        remake(prob,
-               p = pars,
-               u0 = u0tmp,
-               callback = callback,
-               noise = NG)
+        SDE.remake(prob; p = pars, u0 = u0tmp, callback, noise = NG)
     end
 
-    ensembleprob = EnsembleProblem(prob,
-                                   prob_func = prob_func,
-                                   safetycopy = true)
+    ensembleprob = SDE.EnsembleProblem(prob; prob_func, safetycopy = true)
 
-    u = solve(ensembleprob, alg, EnsembleThreads(),
-              saveat = myparameters.tinterval,
-              dt = myparameters.dt,
-              adaptive = false, #abstol=1e-6, reltol=1e-6,
-              trajectories = myparameters.numtrajplot,
-              batch_size = myparameters.numtrajplot)
+    u = SDE.solve(ensembleprob, alg, SDE.EnsembleThreads();
+        saveat = myparameters.tinterval,
+        myparameters.dt,
+        adaptive = false, #abstol=1e-6, reltol=1e-6,
+        trajectories = myparameters.numtrajplot,
+        batch_size = myparameters.numtrajplot)
 
     ceR = @view u[1, :, :]
     cdR = @view u[2, :, :]
     ceI = @view u[3, :, :]
     cdI = @view u[4, :, :]
     infidelity = @. (cdR^2 + cdI^2) / (ceR^2 + cdR^2 + ceI^2 + cdI^2)
-    meaninfidelity = mean(infidelity)
+    meaninfidelity = Statistics.mean(infidelity)
     loss = myparameters.C1 * meaninfidelity
 
     @info "Loss: " loss
 
     fidelity = @. (ceR^2 + ceI^2) / (ceR^2 + cdR^2 + ceI^2 + cdI^2)
 
-    mf = mean(fidelity, dims = 2)[:]
-    sf = std(fidelity, dims = 2)[:]
+    mf = Statistics.mean(fidelity, dims = 2)[:]
+    sf = Statistics.std(fidelity, dims = 2)[:]
 
-    pl1 = plot(0:(myparameters.Nintervals), mf,
-               ribbon = sf,
-               ylim = (0, 1), xlim = (0, myparameters.Nintervals),
-               c = 1, lw = 1.5, xlabel = "steps i", ylabel = "Fidelity", legend = false)
+    pl1 = Plots.plot(0:(myparameters.Nintervals), mf,
+        ribbon = sf,
+        ylim = (0, 1), xlim = (0, myparameters.Nintervals),
+        c = 1, lw = 1.5, xlabel = "steps i", ylabel = "Fidelity", legend = false)
 
-    pl = plot(pl1, legend = false, size = (400, 360))
+    pl = Plots.plot(pl1, legend = false, size = (400, 360))
     return pl, loss
 end
 # callback to visualize training
-visualization_callback = function (p, l; doplot = false)
+visualization_callback = function (state, l; doplot = false)
     println(l)
 
     if doplot
-        pl, _ = visualize(p)
+        pl, _ = visualize(state.u)
         display(pl)
     end
 
@@ -629,7 +617,7 @@ end
 
 ### Training
 
-We use the `ADAM` optimizer to optimize the parameters of the neural network.
+We use the `Adam` optimizer to optimize the parameters of the neural network.
 In each epoch, we draw new initial quantum states, compute the forward evolution,
 and, subsequently, the gradients of the loss function with respect to the parameters
 of the neural network.
@@ -639,17 +627,18 @@ sensitivity methods. The necessary correction between Ito and Stratonovich integ
 is computed under the hood in the SciMLSensitivity package.
 
 ```@example sdecontrol
-# optimize the parameters for a few epochs with ADAM on time span
+# optimize the parameters for a few epochs with Adam on time span
 # Setup and run the optimization
-adtype = Optimization.AutoZygote()
-optf = Optimization.OptimizationFunction((x, p) -> loss(x), adtype)
+adtype = OPT.AutoForwardDiff()
+optf = OPT.OptimizationFunction((x, p) -> loss(x), adtype)
 
-optprob = Optimization.OptimizationProblem(optf, p_nn)
-res = Optimization.solve(optprob, ADAM(myparameters.lr), callback = visualization_callback,
-                         maxiters = 100)
+optprob = OPT.OptimizationProblem(optf, p_nn)
+res = OPT.solve(optprob, OPO.Adam(myparameters.lr),
+    callback = visualization_callback,
+    maxiters = 100)
 
 # plot optimized control
-visualization_callback(res.u, loss(res.u); doplot = true)
+visualization_callback(res, loss(res.u); doplot = true)
 ```
 
 ![Evolution of the fidelity as a function of time](https://user-images.githubusercontent.com/42201748/107991039-10c59200-6fd6-11eb-8a97-a1c8d18a266b.png)

@@ -1,7 +1,8 @@
-struct NILSSSensitivityFunction{iip, F, Alg,
-                                PGPU, PGPP, CONFU, CONGP, DGVAL, DG1, DG2, jType, RefType
-                                } <:
-       DiffEqBase.AbstractODEFunction{iip}
+struct NILSSSensitivityFunction{
+        iip, F, Alg,
+        PGPU, PGPP, CONFU, CONGP, DGVAL, DG1, DG2, jType, RefType,
+    } <:
+    AbstractODEFunction{iip}
     f::F
     alg::Alg
     numparams::Int
@@ -17,11 +18,15 @@ struct NILSSSensitivityFunction{iip, F, Alg,
     cur_time::RefType
 end
 
-function NILSSSensitivityFunction(sensealg, f, u0, p, tspan, g, dgdu, dgdp,
-                                  jevery = nothing,
-                                  cur_time = nothing)
-    !(f.mass_matrix isa UniformScaling ||
-      f.mass_matrix isa Tuple{UniformScaling, UniformScaling}) &&
+function NILSSSensitivityFunction(
+        sensealg, f, u0, p, tspan, g, dgdu, dgdp,
+        jevery = nothing,
+        cur_time = nothing
+    )
+    !(
+        f.mass_matrix isa UniformScaling ||
+            f.mass_matrix isa Tuple{UniformScaling, UniformScaling}
+    ) &&
         throw(SHADOWING_DAE_ERROR())
 
     numparams = length(p)
@@ -51,22 +56,53 @@ function NILSSSensitivityFunction(sensealg, f, u0, p, tspan, g, dgdu, dgdp,
         dg_val[2] .= false
     end
 
-    NILSSSensitivityFunction{isinplace(f), typeof(f), typeof(sensealg),
-                             typeof(pgpu), typeof(pgpp), typeof(pgpu_config),
-                             typeof(pgpp_config), typeof(dg_val), typeof(dgdu),
-                             typeof(dgdp),
-                             typeof(jevery), typeof(cur_time)}(f, sensealg, numparams,
-                                                               numindvar, pgpu, pgpp,
-                                                               pgpu_config, pgpp_config,
-                                                               dg_val, dgdu, dgdp, jevery,
-                                                               cur_time)
+    return NILSSSensitivityFunction{
+        isinplace(f), typeof(f), typeof(sensealg),
+        typeof(pgpu), typeof(pgpp), typeof(pgpu_config),
+        typeof(pgpp_config), typeof(dg_val), typeof(dgdu),
+        typeof(dgdp),
+        typeof(jevery), typeof(cur_time),
+    }(
+        f, sensealg, numparams,
+        numindvar, pgpu, pgpp,
+        pgpu_config, pgpp_config,
+        dg_val, dgdu, dgdp, jevery,
+        cur_time
+    )
 end
 
-struct NILSSProblem{A, CacheType, FSprob, probType, u0Type, vstar0Type, w0Type,
-                    TType, dtType, gType, yType, vstarType,
-                    wType, RType, bType, weightType, CType, dType, BType, aType, vType,
-                    xiType,
-                    G, resType}
+"""
+    NILSSProblem(prob, sensealg::NILSS; kwargs...)
+
+Problem wrapper for non-intrusive least-squares shadowing forward
+sensitivities.
+
+## Arguments
+
+  - `prob`: ODE problem defining the chaotic trajectory.
+  - `sensealg`: `NILSS` algorithm choice.
+
+## Keyword Arguments
+
+  - `t`: discrete saved-time grid. When supplied, it must align with the NILSS
+    segment save spacing.
+  - `dgdu_discrete`, `dgdp_discrete`: derivatives of a discrete objective.
+  - `dgdu_continuous`, `dgdp_continuous`: derivatives of a continuous objective.
+  - `g`: scalar observable; required by `NILSS`.
+
+## Returns
+
+A `NILSSProblem` containing the segmented forward sensitivity problem,
+orthonormalization buffers, quadrature weights, and work arrays consumed by
+`shadow_forward`.
+"""
+struct NILSSProblem{
+        A, CacheType, FSprob, probType, u0Type, vstar0Type, w0Type,
+        TType, dtType, gType, yType, vstarType,
+        wType, RType, bType, weightType, CType, dType, BType, aType, vType,
+        xiType,
+        G, resType,
+    }
     sensealg::A
     diffcache::CacheType
     forward_prob::FSprob
@@ -99,12 +135,14 @@ struct NILSSProblem{A, CacheType, FSprob, probType, u0Type, vstar0Type, w0Type,
     res::resType
 end
 
-function NILSSProblem(prob, sensealg::NILSS;
-                      t = nothing, dgdu_discrete = nothing, dgdp_discrete = nothing,
-                      dgdu_continuous = nothing, dgdp_continuous = nothing, g = sensealg.g,
-                      kwargs...)
-    @unpack f, p, u0, tspan = prob
-    @unpack nseg, nstep, nus, rng = sensealg  #number of segments on time interval, number of steps saved on each segment
+function NILSSProblem(
+        prob, sensealg::NILSS;
+        t = nothing, dgdu_discrete = nothing, dgdp_discrete = nothing,
+        dgdu_continuous = nothing, dgdp_continuous = nothing, g = sensealg.g,
+        kwargs...
+    )
+    (; f, p, u0, tspan) = prob
+    (; nseg, nstep, nus, rng) = sensealg  #number of segments on time interval, number of steps saved on each segment
 
     numindvar = length(u0)
     numparams = length(p)
@@ -144,9 +182,9 @@ function NILSSProblem(prob, sensealg::NILSS;
         cur_time = nothing
         @assert dgdu_discrete === nothing && dgdp_discrete === nothing
         dgdu = dgdu_continuous === nothing ? dgdu_continuous :
-               (out, u, p, t, i) -> dgdu_continuous(out, u, p, t)
+            (out, u, p, t, i) -> dgdu_continuous(out, u, p, t)
         dgdp = dgdp_continuous === nothing ? dgdp_continuous :
-               (out, u, p, t, i) -> dgdp_continuous(out, u, p, t)
+            (out, u, p, t, i) -> dgdp_continuous(out, u, p, t)
     end
 
     # inhomogeneous forward sensitivity problem
@@ -155,15 +193,21 @@ function NILSSProblem(prob, sensealg::NILSS;
     difftype = diff_type(sensealg)
     autojacvec = sensealg.autojacvec
     # homogeneous + inhomogeneous forward sensitivity problems
-    forward_prob = ODEForwardSensitivityProblem(f, u0, tspan, p,
-                                                ForwardSensitivity(chunk_size = chunk_size,
-                                                                   autodiff = autodiff,
-                                                                   diff_type = difftype,
-                                                                   autojacvec = autojacvec);
-                                                nus = nus, kwargs...)
+    forward_prob = ODEForwardSensitivityProblem(
+        f, u0, tspan, p,
+        ForwardSensitivity(;
+            chunk_size,
+            autodiff,
+            diff_type = difftype,
+            autojacvec
+        );
+        nus, kwargs...
+    )
 
-    sense = NILSSSensitivityFunction(sensealg, f, u0, p, tspan, g, dgdu, dgdp, jevery,
-                                     cur_time)
+    sense = NILSSSensitivityFunction(
+        sensealg, f, u0, p, tspan, g, dgdu, dgdp, jevery,
+        cur_time
+    )
 
     # pre-allocate variables
     gsave = Matrix{eltype(u0)}(undef, nstep, nseg)
@@ -216,22 +260,26 @@ function NILSSProblem(prob, sensealg::NILSS;
 
     res = similar(u0, numparams)
 
-    NILSSProblem{typeof(sensealg), typeof(sense), typeof(forward_prob), typeof(prob),
-                 typeof(u0), typeof(vstar0), typeof(w0),
-                 typeof(T_seg), typeof(dtsave), typeof(gsave), typeof(y), typeof(vstar),
-                 typeof(w), typeof(R),
-                 typeof(b), typeof(weight), typeof(Cinv), typeof(d), typeof(B), typeof(a),
-                 typeof(v), typeof(ξ),
-                 typeof(g), typeof(res)}(sensealg, sense, forward_prob, prob,
-                                         u0, vstar0, w0,
-                                         nus, T_seg, dtsave, gsave, y, dudt,
-                                         dgdu_val, vstar, vstar_perp, w, w_perp, R,
-                                         b, weight, Cinv, d,
-                                         B, a, v, v_perp, ξ, g, res)
+    return NILSSProblem{
+        typeof(sensealg), typeof(sense), typeof(forward_prob), typeof(prob),
+        typeof(u0), typeof(vstar0), typeof(w0),
+        typeof(T_seg), typeof(dtsave), typeof(gsave), typeof(y), typeof(vstar),
+        typeof(w), typeof(R),
+        typeof(b), typeof(weight), typeof(Cinv), typeof(d), typeof(B), typeof(a),
+        typeof(v), typeof(ξ),
+        typeof(g), typeof(res),
+    }(
+        sensealg, sense, forward_prob, prob,
+        u0, vstar0, w0,
+        nus, T_seg, dtsave, gsave, y, dudt,
+        dgdu_val, vstar, vstar_perp, w, w_perp, R,
+        b, weight, Cinv, d,
+        B, a, v, v_perp, ξ, g, res
+    )
 end
 
 function (NS::NILSSForwardSensitivityFunction)(du, u, p, t)
-    @unpack S, nus = NS
+    (; S, nus) = NS
     y = @view u[1:(S.numindvar)] # These are the independent variables
     dy = @view du[1:(S.numindvar)]
 
@@ -250,7 +298,7 @@ function (NS::NILSSForwardSensitivityFunction)(du, u, p, t)
         end
     end
 
-    if DiffEqBase.has_paramjac(S.f)
+    if SciMLBase.has_paramjac(S.f)
         S.paramjac(S.pJ, y, p, t) # Calculate the parameter Jacobian into pJ
     else
         S.pf.t = t
@@ -261,10 +309,10 @@ function (NS::NILSSForwardSensitivityFunction)(du, u, p, t)
     # Compute the parameter derivatives
     for j in 1:(nus + 1)
         for i in eachindex(p)
-            indx1 = (j - 1) * S.numindvar * 1 + i * S.numindvar + 1
-            indx2 = (j - 1) * S.numindvar * 1 + (i + 1) * S.numindvar
-            Sj = @view u[indx1:indx2]
-            dp = @view du[indx1:indx2]
+            idx1 = (j - 1) * S.numindvar * 1 + i * S.numindvar + 1
+            idx2 = (j - 1) * S.numindvar * 1 + (i + 1) * S.numindvar
+            Sj = @view u[idx1:idx2]
+            dp = @view du[idx1:idx2]
             if !S.isautojacvec
                 mul!(dp, S.J, Sj)
             else
@@ -281,17 +329,21 @@ end
 
 function forward_sense(prob::NILSSProblem, nilss::NILSS, alg)
     #TODO determine a good dtsave (ΔT in paper, see Sec.4.2)
-    @unpack nus, T_seg, dtsave, vstar, vstar_perp, w, w_perp, R, b, y, dudt, gsave, dgdu_val, forward_prob, u0, vstar0, w0 = prob
-    @unpack p, f = forward_prob
-    @unpack S, sensealg = f
-    @unpack nseg, nstep = nilss
-    @unpack numindvar, numparams = S
+    (;
+        nus, T_seg, dtsave, vstar, vstar_perp, w, w_perp, R, b, y,
+        dudt, gsave, dgdu_val, forward_prob, u0, vstar0, w0,
+    ) = prob
+    (; p, f) = forward_prob
+    (; S, sensealg) = f
+    (; nseg, nstep) = nilss
+    (; numindvar, numparams) = S
 
     # push forward
     t1 = forward_prob.tspan[1]
     t2 = forward_prob.tspan[1] + T_seg
-    _prob = ODEForwardSensitivityProblem(S.f, u0, (t1, t2), p, sensealg; nus = nus, w0 = w0,
-                                         v0 = vstar0)
+    _prob = ODEForwardSensitivityProblem(
+        S.f, u0, (t1, t2), p; sensealg, nus, w0, v0 = vstar0
+    )
 
     for iseg in 1:nseg
         # compute y, w, vstar
@@ -314,12 +366,15 @@ function forward_sense(prob::NILSSProblem, nilss::NILSS, alg)
             renormalize!(R, b, w_perp, vstar_perp, y, vstar, w, iseg, numparams, nus)
             t1 = forward_prob.tspan[1] + iseg * T_seg
             t2 = forward_prob.tspan[1] + (iseg + 1) * T_seg
-            _prob = ODEForwardSensitivityProblem(S.f, y[:, 1, iseg + 1], (t1, t2), p,
-                                                 sensealg; nus = nus,
-                                                 w0 = vec(w[:, 1, iseg + 1, :]),
-                                                 v0 = vec(vstar[:, :, 1, iseg + 1]))
+            _prob = ODEForwardSensitivityProblem(
+                S.f, y[:, 1, iseg + 1], (t1, t2), p;
+                sensealg, nus,
+                w0 = vec(w[:, 1, iseg + 1, :]),
+                v0 = vec(vstar[:, :, 1, iseg + 1])
+            )
         end
     end
+    return
 end
 
 function store_y_w_vstar!(y, w, vstar, sol, nus, numindvar, numparams, iseg)
@@ -330,28 +385,28 @@ function store_y_w_vstar!(y, w, vstar, sol, nus, numindvar, numparams, iseg)
     # fill w
     # only calculate w one time, w can be reused for each parameter
     for j in 1:nus
-        indx1 = (j - 1) * numindvar * 1 + numindvar + 1
-        indx2 = (j - 1) * numindvar * 1 + 2 * numindvar
+        idx1 = (j - 1) * numindvar * 1 + numindvar + 1
+        idx2 = (j - 1) * numindvar * 1 + 2 * numindvar
 
         _w = @view w[:, :, iseg, j]
-        copyto!(_w, (@view sol[indx1:indx2, :]))
+        copyto!(_w, (@view sol[idx1:idx2, :]))
     end
 
     # fill vstar
     for i in 1:numparams
-        indx1 = nus * numindvar * 1 + i * numindvar + 1
-        indx2 = nus * numindvar * 1 + (i + 1) * numindvar
+        idx1 = nus * numindvar * 1 + i * numindvar + 1
+        idx2 = nus * numindvar * 1 + (i + 1) * numindvar
         _vstar = @view vstar[i, :, :, iseg]
-        copyto!(_vstar, (@view sol[indx1:indx2, :]))
+        copyto!(_vstar, (@view sol[idx1:idx2, :]))
     end
 
     return nothing
 end
 
 function dudt_g_dgdu!(dudt, dgdu_val, gsave, nilssprob::NILSSProblem, y, p, iseg)
-    @unpack sensealg, diffcache, g, prob = nilssprob
-    @unpack prob = nilssprob
-    @unpack dgdu, jevery, cur_time = diffcache # akin to ``discrete"
+    (; sensealg, diffcache, g, prob) = nilssprob
+    (; prob) = nilssprob
+    (; jevery, cur_time) = diffcache
 
     _y = @view y[:, :, iseg]
 
@@ -388,16 +443,16 @@ function dudt_g_dgdu!(dudt, dgdu_val, gsave, nilssprob::NILSSProblem, y, p, iseg
 end
 
 function perp!(w_perp, vstar_perp, w, vstar, dudt, iseg, numparams, nsteps, nus)
-    for indx_steps in 1:nsteps
-        _dudt = @view dudt[:, indx_steps, iseg]
-        for indx_nus in 1:nus
-            _w_perp = @view w_perp[:, indx_steps, iseg, indx_nus]
-            _w = @view w[:, indx_steps, iseg, indx_nus]
+    for idx_steps in 1:nsteps
+        _dudt = @view dudt[:, idx_steps, iseg]
+        for idx_nus in 1:nus
+            _w_perp = @view w_perp[:, idx_steps, iseg, idx_nus]
+            _w = @view w[:, idx_steps, iseg, idx_nus]
             perp!(_w_perp, _w, _dudt)
         end
-        for indx_params in 1:numparams
-            _vstar_perp = @view vstar_perp[indx_params, :, indx_steps, iseg]
-            _vstar = @view vstar[indx_params, :, indx_steps, iseg]
+        for idx_params in 1:numparams
+            _vstar_perp = @view vstar_perp[idx_params, :, idx_steps, iseg]
+            _vstar = @view vstar[idx_params, :, idx_steps, iseg]
             perp!(_vstar_perp, _vstar, _dudt)
         end
     end
@@ -406,7 +461,7 @@ function perp!(w_perp, vstar_perp, w, vstar, dudt, iseg, numparams, nsteps, nus)
 end
 
 function perp!(v1, v2, v3)
-    v1 .= v2 - dot(v2, v3) / dot(v3, v3) * v3
+    return v1 .= v2 - dot(v2, v3) / dot(v3, v3) * v3
 end
 
 function renormalize!(R, b, w_perp, vstar_perp, y, vstar, w, iseg, numparams, nus)
@@ -434,12 +489,14 @@ function renormalize!(R, b, w_perp, vstar_perp, y, vstar, w, iseg, numparams, nu
     return nothing
 end
 
-function compute_Cinv!(Cinv, w_perp, weight, nseg, nus, indxp)
+function compute_Cinv!(Cinv, w_perp, weight, nseg, nus, idxp)
     # construct Schur complement of Lagrange multiplier
     _weight = @view weight[1, :]
     for iseg in 1:nseg
-        _C = @view Cinv[((iseg - 1) * nus + 1):(iseg * nus),
-                        ((iseg - 1) * nus + 1):(iseg * nus)]
+        _C = @view Cinv[
+            ((iseg - 1) * nus + 1):(iseg * nus),
+            ((iseg - 1) * nus + 1):(iseg * nus),
+        ]
         for i in 1:nus
             wi = @view w_perp[:, :, iseg, i]
             for j in 1:nus
@@ -453,12 +510,12 @@ function compute_Cinv!(Cinv, w_perp, weight, nseg, nus, indxp)
     return nothing
 end
 
-function compute_d!(d, w_perp, vstar_perp, weight, nseg, nus, indxp)
+function compute_d!(d, w_perp, vstar_perp, weight, nseg, nus, idxp)
     # construct d
     _weight = @view weight[1, :]
     for iseg in 1:nseg
         _d = @view d[((iseg - 1) * nus + 1):(iseg * nus)]
-        vi = @view vstar_perp[indxp, :, :, iseg]
+        vi = @view vstar_perp[idxp, :, :, iseg]
         for i in 1:nus
             wi = @view w_perp[:, :, iseg, i]
             _d[i] = sum(wi .* vi * _weight)
@@ -467,11 +524,13 @@ function compute_d!(d, w_perp, vstar_perp, weight, nseg, nus, indxp)
     return nothing
 end
 
-function compute_B!(B, R, nseg, nus, indxp)
+function compute_B!(B, R, nseg, nus, idxp)
     for iseg in 1:(nseg - 1)
-        _B = @view B[((iseg - 1) * nus + 1):(iseg * nus),
-                     ((iseg - 1) * nus + 1):(iseg * nus)]
-        _R = @view R[indxp, iseg, :, :]
+        _B = @view B[
+            ((iseg - 1) * nus + 1):(iseg * nus),
+            ((iseg - 1) * nus + 1):(iseg * nus),
+        ]
+        _R = @view R[idxp, iseg, :, :]
         copyto!(_B, -_R)
         # off diagonal one
         for i in 1:nus
@@ -481,17 +540,17 @@ function compute_B!(B, R, nseg, nus, indxp)
     return nothing
 end
 
-function compute_a!(a, B, Cinv, b, d, indxp)
-    _b = @view b[indxp, :]
+function compute_a!(a, B, Cinv, b, d, idxp)
+    _b = @view b[idxp, :]
 
     lbd = (-B * Cinv * B') \ (B * Cinv * d + _b)
     a .= -Cinv * (B' * lbd + d)
     return nothing
 end
 
-function compute_v!(v, v_perp, vstar, vstar_perp, w, w_perp, a, nseg, nus, indxp)
-    _vstar = @view vstar[indxp, :, :, :]
-    _vstar_perp = @view vstar_perp[indxp, :, :, :]
+function compute_v!(v, v_perp, vstar, vstar_perp, w, w_perp, a, nseg, nus, idxp)
+    _vstar = @view vstar[idxp, :, :, :]
+    _vstar_perp = @view vstar_perp[idxp, :, :, :]
 
     copyto!(v, _vstar)
     copyto!(v_perp, _vstar_perp)
@@ -523,20 +582,22 @@ function compute_xi(ξ, v, dudt, nseg)
     end
     # check if segmentation is chosen correctly
     _ξ = ξ[:, 1]
-    all(_ξ .< 1e-4) || @warn "Detected a large value of ξ at the beginning of a segment."
+    all(_ξ .< 1.0e-4) || @warn "Detected a large value of ξ at the beginning of a segment."
     return nothing
 end
 
-function accumulate_cost!(_dgdu, u, p, t, sensealg::NILSS,
-                          diffcache::NILSSSensitivityFunction, j)
-    @unpack dgdu, dgdp, dg_val, pgpu, pgpu_config, pgpp, pgpp_config = diffcache
+function accumulate_cost!(
+        _dgdu, u, p, t, sensealg::NILSS,
+        diffcache::NILSSSensitivityFunction, j
+    )
+    (; dgdu, dgdp, dg_val, pgpu, pgpu_config, pgpp, pgpp_config) = diffcache
 
     if dgdu === nothing
         if dg_val isa Tuple
-            SciMLSensitivity.gradient!(dg_val[1], pgpu, u, sensealg, pgpu_config)
+            gradient!(dg_val[1], pgpu, u, sensealg, pgpu_config)
             copyto!(_dgdu, dg_val[1])
         else
-            SciMLSensitivity.gradient!(dg_val, pgpu, u, sensealg, pgpu_config)
+            gradient!(dg_val, pgpu, u, sensealg, pgpu_config)
             copyto!(_dgdu, dg_val)
         end
     else
@@ -553,17 +614,19 @@ function accumulate_cost!(_dgdu, u, p, t, sensealg::NILSS,
 end
 
 function shadow_forward(prob::NILSSProblem, alg; sensealg = prob.sensealg)
-    shadow_forward(prob, sensealg, alg)
+    return shadow_forward(prob, sensealg, alg)
 end
 
 function shadow_forward(prob::NILSSProblem, sensealg::NILSS, alg)
-    @unpack nseg, nstep = sensealg
-    @unpack res, nus, dtsave, vstar, vstar_perp, w, w_perp, R, b, dudt,
-    gsave, dgdu_val, forward_prob, weight, Cinv, d, B, a, v, v_perp, ξ = prob
-    @unpack numindvar, numparams = forward_prob.f.S
+    (; nseg, nstep) = sensealg
+    (;
+        res, nus, dtsave, vstar, vstar_perp, w, w_perp, R, b, dudt,
+        gsave, dgdu_val, forward_prob, weight, Cinv, d, B, a, v, v_perp, ξ,
+    ) = prob
+    (; numindvar, numparams) = forward_prob.f.S
 
     # reset dg pointer
-    @unpack jevery, cur_time = prob.diffcache
+    (; jevery, cur_time) = prob.diffcache
     jevery !== nothing && (cur_time[] = one(jevery))
 
     # compute vstar, w
@@ -590,8 +653,7 @@ function shadow_forward(prob::NILSSProblem, sensealg::NILSS, alg)
             _dgdu = @view dgdu_val[:, :, iseg]
             _v = @view v[:, :, iseg]
             res[i] += sum((_v .* _dgdu) * _weight) / ((nstep - 1) * nseg)
-            res[i] += ξ[iseg, end] * (gavg - gsave[end, iseg]) /
-                      (dtsave * (nstep - 1) * nseg)
+            res[i] += ξ[iseg, end] * (gavg - gsave[end, iseg]) / (dtsave * (nstep - 1) * nseg)
         end
     end
 
@@ -599,5 +661,5 @@ function shadow_forward(prob::NILSSProblem, sensealg::NILSS, alg)
 end
 
 function check_for_g(sensealg::NILSS, g)
-    (g === nothing && error("To use NILSS, g must be passed as a kwarg to `NILSS(g=g)`."))
+    return (g === nothing && error("To use NILSS, g must be passed as a kwarg to `NILSS(g=g)`."))
 end

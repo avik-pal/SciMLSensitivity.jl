@@ -1,113 +1,189 @@
-using SciMLSensitivity, SafeTestsets
-using Test, Pkg
+using SafeTestsets
+using Test
+using SciMLTesting
 
-const GROUP = get(ENV, "GROUP", "All")
-
-function activate_gpu_env()
-    Pkg.activate("gpu")
-    Pkg.develop(PackageSpec(path = dirname(@__DIR__)))
-    Pkg.instantiate()
+# The GPU group runs in its own environment, activated in this process. Loading
+# SciMLSensitivity from the base test env first would pin its dependencies (e.g.
+# GPUCompiler) to versions the GPU env's CUDA cannot use.
+if current_group() != "GPU"
+    using SciMLSensitivity
+    import Mooncake
 end
 
-@time begin
-    if GROUP == "All" || GROUP == "Core1" || GROUP == "Downstream"
-        @time @safetestset "Forward Sensitivity" begin include("forward.jl") end
-        @time @safetestset "Sparse Adjoint Sensitivity" begin include("sparse_adjoint.jl") end
-        @time @safetestset "Second Order Sensitivity" begin include("second_order.jl") end
-        @time @safetestset "Concrete Solve Derivatives" begin include("concrete_solve_derivatives.jl") end
-        @time @safetestset "Branching Derivatives" begin include("branching_derivatives.jl") end
-        @time @safetestset "Derivative Shapes" begin include("derivative_shapes.jl") end
-        @time @safetestset "save_idxs" begin include("save_idxs.jl") end
-        @time @safetestset "ArrayPartitions" begin include("array_partitions.jl") end
-        @time @safetestset "Complex Adjoints" begin include("complex_adjoints.jl") end
-        @time @safetestset "Forward Remake" begin include("forward_remake.jl") end
-        @time @safetestset "Prob Kwargs" begin include("prob_kwargs.jl") end
-        @time @safetestset "DiscreteProblem Adjoints" begin include("discrete.jl") end
-        @time @safetestset "Time Type Mixing Adjoints" begin include("time_type_mixing.jl") end
-    end
-
-    if GROUP == "All" || GROUP == "Core2"
-        @time @safetestset "hasbranching" begin include("hasbranching.jl") end
-        @time @safetestset "Literal Adjoint" begin include("literal_adjoint.jl") end
-        @time @safetestset "ForwardDiff Chunking Adjoints" begin include("forward_chunking.jl") end
-        @time @safetestset "Stiff Adjoints" begin include("stiff_adjoints.jl") end
-        @time @safetestset "Scalar u0" begin include("scalar_u.jl") end
-        @time @safetestset "Error Messages" begin include("error_messages.jl") end
-        @time @safetestset "Autodiff Events" begin include("autodiff_events.jl") end
-        @time @safetestset "Null Parameters" begin include("null_parameters.jl") end
-        @time @safetestset "Forward Mode Prob Kwargs" begin include("forward_prob_kwargs.jl") end
-        @time @safetestset "Steady State Adjoint" begin include("steady_state.jl") end
-        @time @safetestset "Concrete Solve Derivatives of Second Order ODEs" begin include("second_order_odes.jl") end
-        @time @safetestset "Parameter Compatibility Errors" begin include("parameter_compatibility_errors.jl") end
-    end
-
-    if GROUP == "All" || GROUP == "Core3" || GROUP == "Downstream"
-        @time @safetestset "Adjoint Sensitivity" begin include("adjoint.jl") end
-        @time @safetestset "Continuous adjoint params" begin include("adjoint_param.jl") end
-        @time @safetestset "Continuous and discrete costs" begin include("mixed_costs.jl") end
-        @time @safetestset "Fully Out of Place adjoint sensitivity" begin include("adjoint_oop.jl") end
-        @time @safetestset "Differentiate LazyBuffer with ReverseDiff" begin include("lazybuffer.jl") end
-    end
-
-    if GROUP == "All" || GROUP == "Core4"
-        @time @safetestset "Ensemble Tests" begin include("ensembles.jl") end
-        @time @safetestset "GDP Regression Tests" begin include("gdp_regression_test.jl") end
-        @time @safetestset "Layers Tests" begin include("layers.jl") end
-        @time @safetestset "Layers SDE" begin include("layers_sde.jl") end
-        @time @safetestset "Layers DDE" begin include("layers_dde.jl") end
-        @time @safetestset "SDE - Neural" begin include("sde_neural.jl") end
-
-        # No `@safetestset` since it requires running in Main
-        @time @testset "Distributed" begin include("distributed.jl") end
-    end
-
-    if GROUP == "All" || GROUP == "Core5"
-        @time @safetestset "Partial Neural Tests" begin include("partial_neural.jl") end
-        @time @safetestset "Size Handling in Adjoint Tests" begin include("size_handling_adjoint.jl") end
-        @time @safetestset "Callback - ReverseDiff" begin include("callback_reversediff.jl") end
-        @time @safetestset "Alternative AD Frontend" begin include("alternative_ad_frontend.jl") end
-        @time @safetestset "Hybrid DE" begin include("hybrid_de.jl") end
-        @time @safetestset "HybridNODE" begin include("HybridNODE.jl") end
-        @time @safetestset "ForwardDiff Sparsity Components" begin include("forwarddiffsensitivity_sparsity_components.jl") end
-        @time @safetestset "Complex No u" begin include("complex_no_u.jl") end
-    end
-
-    if GROUP == "All" || GROUP == "SDE1"
-        @time @safetestset "SDE Adjoint" begin include("sde_stratonovich.jl") end
-        @time @safetestset "SDE Scalar Noise" begin include("sde_scalar_stratonovich.jl") end
-        @time @safetestset "SDE Checkpointing" begin include("sde_checkpointing.jl") end
-    end
-
-    if GROUP == "All" || GROUP == "SDE2"
-        @time @safetestset "SDE Non-Diagonal Noise" begin include("sde_nondiag_stratonovich.jl") end
-    end
-
-    if GROUP == "All" || GROUP == "SDE3"
-        @time @safetestset "RODE Tests" begin include("rode.jl") end
-        @time @safetestset "SDE Ito Conversion Tests" begin include("sde_transformation_test.jl") end
-        @time @safetestset "SDE Ito Scalar Noise" begin include("sde_scalar_ito.jl") end
-    end
-
-    if GROUP == "Callbacks1"
-        @time @safetestset "Discrete Callbacks with ForwardDiffSensitivity" begin include("callbacks/forward_sensitivity_callback.jl") end
-        @time @safetestset "Discrete Callbacks with Adjoints" begin include("callbacks/discrete_callbacks.jl") end
-        @time @safetestset "SDE Callbacks" begin include("callbacks/SDE_callbacks.jl") end
-        @time @safetestset "Non-tracked callbacks" begin include("callbacks/non_tracked_callbacks.jl") end
-    end
-
-    if GROUP == "Callbacks2"
-        @time @safetestset "Continuous vs. discrete Callbacks" begin include("callbacks/continuous_vs_discrete.jl") end
-        @time @safetestset "Continuous Callbacks with Adjoints" begin include("callbacks/continuous_callbacks.jl") end
-        @time @safetestset "VectorContinuousCallbacks with Adjoints" begin include("callbacks/vector_continuous_callbacks.jl") end
-    end
-
-    if GROUP == "Shadowing"
-        @time @safetestset "Shadowing Tests" begin include("shadowing.jl") end
-    end
-
-    if GROUP == "GPU"
-        activate_gpu_env()
-        @time @safetestset "Standard DiffEqFlux GPU" begin include("gpu/diffeqflux_standard_gpu.jl") end
-        @time @safetestset "Mixed GPU/CPU" begin include("gpu/mixed_gpu_cpu_adjoint.jl") end
-    end
-end
+run_tests(;
+    core = () -> nothing,
+    groups = Dict(
+        "Core1" => function ()
+            return @testset "Core1" begin
+                @time @safetestset "Forward Sensitivity" include("Core1/forward.jl")
+                @time @safetestset "Sparse Adjoint Sensitivity" include("Core1/sparse_adjoint.jl")
+                @time @safetestset "Adjoint Shapes" include("Core1/adjoint_shapes.jl")
+                @time @safetestset "Second Order Sensitivity" include("Core1/second_order.jl")
+                @time @safetestset "Concrete Solve Derivatives" include("Core1/concrete_solve_derivatives.jl")
+                @time @safetestset "Branching Derivatives" include("Core1/branching_derivatives.jl")
+                @time @safetestset "Derivative Shapes" include("Core1/derivative_shapes.jl")
+                @time @safetestset "save_idxs" include("Core1/save_idxs.jl")
+                @time @safetestset "ArrayPartitions" include("Core1/array_partitions.jl")
+                @time @safetestset "Complex Adjoints" include("Core1/complex_adjoints.jl")
+                @time @safetestset "ReverseDiffAdjoint Output Type" include("Core1/reversediff_output_types.jl")
+                @time @safetestset "Forward Remake" include("Core1/forward_remake.jl")
+                @time @safetestset "Prob Kwargs" include("Core1/prob_kwargs.jl")
+                @time @safetestset "Wrapped Solutions" include("Core1/wrapped_solutions.jl")
+                @time @safetestset "Mooncake VJP Prob Kwargs" include("Core1/mooncake_vjp_prob_kwargs.jl")
+                @time @safetestset "DiscreteProblem Adjoints" include("Core1/discrete.jl")
+                @time @safetestset "Time Type Mixing Adjoints" include("Core1/time_type_mixing.jl")
+                @time @safetestset "SciMLStructures Interface" include("Core1/scimlstructures_interface.jl")
+                @time @safetestset "Functor Parameters" include("Core1/functor_params.jl")
+                @time @safetestset "Sensitivity Verbosity" include("Core1/sensitivity_verbosity.jl")
+                @time @safetestset "sensealg ADTypes autodiff" include("Core1/sensealg_adtypes.jl")
+                @time @safetestset "Precompile workload" include("Core1/precompile_workload.jl")
+            end
+        end,
+        "Core2" => function ()
+            return @testset "Core 2" begin
+                @time @safetestset "Literal Adjoint" include("Core2/literal_adjoint.jl")
+                @time @safetestset "ForwardDiff Chunking Adjoints" include("Core2/forward_chunking.jl")
+                @time @safetestset "Stiff Adjoints" include("Core2/stiff_adjoints.jl")
+                @time @safetestset "Scalar u0" include("Core2/scalar_u.jl")
+                @time @safetestset "Error Messages" include("Core2/error_messages.jl")
+                @time @safetestset "Autodiff Events" include("Core2/autodiff_events.jl")
+                @time @safetestset "Enzyme VJP Inactive" include("Core2/enzyme_vjp_inactive.jl")
+                @time @safetestset "Enzyme VJP View ComponentArray" include("Core2/enzyme_view_componentarray.jl")
+                @time @safetestset "Sundials CVODES Adjoint" include("Core2/sundials_adjoint.jl")
+                @time @safetestset "Sundials IDAS DAE Adjoint" include("Core2/sundials_idas_adjoint.jl")
+            end
+        end,
+        "Core3" => function ()
+            return @testset "Core 3" begin
+                @time @safetestset "Default DiffEq Alg" include("Core3/default_alg_diff.jl")
+                @time @safetestset "Adjoint Sensitivity" include("Core3/adjoint.jl")
+                @time @safetestset "DAEProblem Adjoint Sensitivity" include("Core3/dae_adjoint.jl")
+                @time @safetestset "automatic sensealg choice" include("Core3/automatic_sensealg_choice.jl")
+                @time @safetestset "GaussAdjoint ZygoteVJP In-Place" include("Core3/gauss_zygote_inplace.jl")
+                @time @safetestset "Adjoint Allocation Regression" include("Core3/allocation_regression.jl")
+                @time @safetestset "SensitivityFunction developer interface" include("Core3/sensitivity_interface.jl")
+                @time @safetestset "User-provided VJP" include("Core3/user_vjp.jl")
+                @time @safetestset "ReverseDiff interpolant forcing" include("Core3/reversediff_interpolant_forcing.jl")
+            end
+        end,
+        "Core4" => function ()
+            return @testset "Core 4" begin
+                @time @safetestset "Ensemble Tests" include("Core4/ensembles.jl")
+                @time @safetestset "GDP Regression Tests" include("Core4/gdp_regression_test.jl")
+                @time @safetestset "Layers Tests" include("Core4/layers.jl")
+                @time @safetestset "Layers SDE" include("Core4/layers_sde.jl")
+                @time @safetestset "Layers DDE" include("Core4/layers_dde.jl")
+                @time @safetestset "SDE - Neural" include("Core4/sde_neural.jl")
+                # No `@safetestset` since it requires running in Main
+                @time @testset "Distributed" include("Core4/distributed.jl")
+            end
+        end,
+        "Core5" => function ()
+            return @testset "Core 5" begin
+                @time @safetestset "Nested AD Regression Tests" include("Core5/nested_ad_regression.jl")
+                @time @safetestset "Size Handling in Adjoint Tests" include("Core5/size_handling_adjoint.jl")
+                @time @safetestset "Callback - ReverseDiff" include("Core5/callback_reversediff.jl")
+                @time @safetestset "Hybrid DE" include("Core5/hybrid_de.jl")
+                @time @safetestset "HybridNODE" include("Core5/HybridNODE.jl")
+                @time @safetestset "ForwardDiff Sparsity Components" include("Core5/forwarddiffsensitivity_sparsity_components.jl")
+                @time @safetestset "Forward Sensitivity Sparse Jacobian" include("Core5/forward_sensitivity_sparse_jac.jl")
+                @time @safetestset "Complex No u" include("Core5/complex_no_u.jl")
+                @time @safetestset "Parameter Handling" include("Core5/parameter_handling.jl")
+            end
+        end,
+        "Core6" => function ()
+            return @testset "Core 6" begin
+                @time @safetestset "Enzyme Closures" include("Core6/enzyme_closure.jl")
+                @time @safetestset "Complex Matrix FiniteDiff Adjoint" include("Core6/complex_matrix_finitediff.jl")
+                @time @safetestset "Null Parameters" include("Core6/null_parameters.jl")
+                @time @safetestset "Forward Mode Prob Kwargs" include("Core6/forward_prob_kwargs.jl")
+                @time @safetestset "Steady State Adjoint" include("Core6/steady_state.jl")
+                @time @safetestset "Optimization Adjoint" include("Core6/optimization_adjoint.jl")
+                @time @safetestset "Concrete Solve Derivatives of Second Order ODEs" include("Core6/second_order_odes.jl")
+                @time @safetestset "Parameter Compatibility Errors" include("Core6/parameter_compatibility_errors.jl")
+            end
+        end,
+        "Core7" => function ()
+            return @testset "Core 7" begin
+                @time @safetestset "Physical ODE Adjoint Regression Test" include("Core7/physical_ode_regression.jl")
+                @time @safetestset "Continuous adjoint params" include("Core7/adjoint_param.jl")
+                @time @safetestset "Continuous and discrete costs" include("Core7/mixed_costs.jl")
+                @time @safetestset "Fully Out of Place adjoint sensitivity" include("Core7/adjoint_oop.jl")
+                @time @safetestset "Differentiate LazyBuffer with ReverseDiff" include("Core7/lazybuffer.jl")
+                # Core 7 was split off from Core 3 due to leaks in the testsets described here https://github.com/SciML/SciMLSensitivity.jl/pull/1024
+            end
+        end,
+        "Core8" => function ()
+            return @testset "Core 8" begin
+                @time @safetestset "Adjoints through NonlinearProblem" include("Core8/parameter_initialization.jl")
+                @time @safetestset "NLLS stationarity adjoint" include("Core8/nlls_adjoint.jl")
+                @time @safetestset "Initialization with MTK" include("Core8/desauty_dae_mwe.jl")
+                @time @safetestset "MTK Forward Mode" include("Core8/mtk.jl")
+                @time @safetestset "Observed parameter cotangent" include("Core8/observed_parameter.jl")
+                @time @safetestset "Nonlinear observed parameter cotangent" include("Core8/nonlinear_observed_parameter.jl")
+                @time @safetestset "MTK Events Adjoint" include("Core8/mtk_events.jl")
+                @time @safetestset "SCCNonlinearProblem" include("Core8/scc_nonlinearsolve.jl")
+                @time @safetestset "EnzymeVJP Repeated Adjoint" include("Core8/enzyme_vjp_repeated_adjoint.jl")
+            end
+        end,
+        "SDE1" => function ()
+            return @testset "SDE 1" begin
+                @time @safetestset "SDE Adjoint" include("SDE1/sde_stratonovich.jl")
+                @time @safetestset "SDE Scalar Noise" include("SDE1/sde_scalar_stratonovich.jl")
+                @time @safetestset "SDE Checkpointing" include("SDE1/sde_checkpointing.jl")
+            end
+        end,
+        "SDE2" => function ()
+            return @testset "SDE 2" begin
+                @time @safetestset "SDE Non-Diagonal Noise" include("SDE2/sde_nondiag_stratonovich.jl")
+            end
+        end,
+        "SDE3" => function ()
+            return @testset "SDE 3" begin
+                @time @safetestset "RODE Tests" include("SDE3/rode.jl")
+                @time @safetestset "SDE Ito Conversion Tests" include("SDE3/sde_transformation_test.jl")
+                @time @safetestset "SDE Ito Scalar Noise" include("SDE3/sde_scalar_ito.jl")
+            end
+        end,
+        "Callbacks1" => function ()
+            return @testset "Callbacks 1" begin
+                @time @safetestset "Discrete Callbacks with ForwardDiffSensitivity" include("Callbacks1/forward_sensitivity_callback.jl")
+                @time @safetestset "Discrete Callbacks with Adjoints" include("Callbacks1/discrete_callbacks.jl")
+                @time @safetestset "SDE Callbacks" include("Callbacks1/SDE_callbacks.jl")
+                @time @safetestset "Non-tracked callbacks" include("Callbacks1/non_tracked_callbacks.jl")
+            end
+        end,
+        "Callbacks2" => function ()
+            return @testset "Callbacks 2" begin
+                @time @safetestset "Continuous vs. discrete Callbacks" include("Callbacks2/continuous_vs_discrete.jl")
+                @time @safetestset "Continuous Callbacks with Adjoints" include("Callbacks2/continuous_callbacks.jl")
+                @time @safetestset "VectorContinuousCallbacks with Adjoints" include("Callbacks2/vector_continuous_callbacks.jl")
+            end
+        end,
+        "Shadowing" => function ()
+            return @testset "Shadowing" begin
+                @time @safetestset "Shadowing Tests" include("Shadowing/shadowing.jl")
+            end
+        end,
+        "GPU" => (;
+            env = joinpath(@__DIR__, "GPU"),
+            body = function ()
+                return @testset "GPU" begin
+                    @time @safetestset "Standard DiffEqFlux GPU" include("GPU/diffeqflux_standard_gpu.jl")
+                    @time @safetestset "Mixed GPU/CPU" include("GPU/mixed_gpu_cpu_adjoint.jl")
+                    @time @safetestset "TrackerAdjoint DiffEqArray" include("GPU/tracker_adjoint_diffeqarray.jl")
+                end
+            end,
+        ),
+    ),
+    qa = function ()
+        return @testset "Quality Assurance" begin
+            @time @safetestset "Aqua" include("QA/aqua.jl")
+        end
+    end,
+    all = [
+        "Core1", "Core2", "Core3", "Core4", "Core5", "Core6", "Core7", "Core8",
+        "SDE1", "SDE2", "SDE3",
+    ],
+    umbrellas = Dict("Downstream" => ["Core1", "Core3"]),
+)

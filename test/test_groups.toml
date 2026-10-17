@@ -1,0 +1,47 @@
+[Core1]
+versions = ["1", "1.11", "lts"]
+
+["Core1 32-bit"]
+group = "Core1"
+versions = ["1"]
+os = ["ubuntu-latest"]
+arch = "x86"
+
+[Core2]
+versions = ["1", "1.11", "lts"]
+
+[Core3]
+versions = ["1", "1.11", "lts"]
+
+[Core4]
+versions = ["1", "1.11", "lts"]
+
+[Core5]
+versions = ["1", "1.11", "lts"]
+
+[Core6]
+versions = ["1", "1.11", "lts"]
+
+[Core7]
+versions = ["1", "1.11", "lts"]
+
+[Core8]
+versions = ["1", "1.11", "lts"]
+
+[QA]
+versions = ["lts", "1"]
+
+[SDE1]
+versions = ["1", "1.11", "lts"]
+
+[SDE2]
+versions = ["1", "1.11", "lts"]
+
+[SDE3]
+versions = ["1", "1.11", "lts"]
+
+[Callbacks1]
+versions = ["1", "1.11", "lts"]
+
+[Callbacks2]
+versions = ["1", "1.11", "lts"]

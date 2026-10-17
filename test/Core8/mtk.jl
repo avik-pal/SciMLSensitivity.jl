@@ -1,0 +1,354 @@
+using ModelingToolkit, OrdinaryDiffEq
+using ModelingToolkit: t_nounits as t, D_nounits as D
+using OrdinaryDiffEq
+using OrdinaryDiffEqCore
+using OrdinaryDiffEqNonlinearSolve: BrownFullBasicInit
+using SciMLBase: CheckInit, NoInit
+using SciMLSensitivity
+using Enzyme
+using Mooncake
+using Tracker
+using Zygote
+import SciMLStructures as SS
+using SymbolicIndexingInterface
+using Test
+
+@parameters σ ρ β A[1:3]
+@variables x(t) y(t) z(t) w(t) w2(t)
+
+eqs = [
+    D(D(x)) ~ σ * (y - x),
+    D(y) ~ x * (ρ - z) - y,
+    D(z) ~ x * y - β * z,
+    w ~ x + y + z + 2 * β,
+]
+
+@mtkbuild sys = ODESystem(eqs, t)
+
+u0 = [
+    D(x) => 2.0,
+    x => 1.0,
+    y => 0.0,
+    z => 0.0,
+]
+
+p = [
+    σ => 28.0,
+    ρ => 10.0,
+    β => 8 / 3,
+]
+# A => ones(3),]
+
+tspan = (0.0, 100.0)
+prob = ODEProblem(sys, u0, tspan, p, jac = true)
+sol = solve(prob, Tsit5())
+
+# Extract tunables as Vector{Float64} for AD compatibility
+tunables, repack, _ = SS.canonicalize(SS.Tunable(), parameter_values(prob))
+
+sensealg = GaussAdjoint(; autojacvec = SciMLSensitivity.EnzymeVJP())
+
+dmtk = Tracker.gradient(tunables) do tunables
+    new_sol = solve(prob, Tsit5(); p = repack(tunables), sensealg)
+    sum(new_sol)
+end
+
+# Verify observed function identity holds for the solution
+mtkparams = SciMLSensitivity.parameter_values(sol)
+test_sol = solve(prob, Tsit5(); p = mtkparams)
+@test all(isapprox.(test_sol[x + y + z + 2 * β - w], 0, atol = 1.0e-12))
+
+# Force DAE handling for Initialization
+
+eqs = [
+    D(D(x)) ~ σ * (y - x),
+    D(y) ~ x * (ρ - z) - y,
+    D(z) ~ x * y - β * z,
+    w ~ x + y + z + 2 * β,
+    0 ~ x^2 + y^2 - w2^2,
+]
+
+@mtkbuild sys = ODESystem(eqs, t)
+
+u0_incorrect = [
+    D(x) => 2.0,
+    x => 1.0,
+    y => 0.0,
+    z => 0.0,
+]
+
+p = [
+    σ => 28.0,
+    ρ => 10.0,
+    β => 8 / 3,
+]
+
+tspan = (0.0, 100.0)
+
+# Check that the gradients for the `solve` are the same both for an initialization
+# (for the algebraic variables) initialized poorly (therefore needs correction with BrownBasicInit)
+# and with the initialization corrected to satisfy the algebraic equation
+prob_incorrectu0 = ODEProblem(
+    sys, u0_incorrect, tspan, p, jac = true, guesses = [w2 => 0.0],
+)
+tunables_incorrectu0, repack_incorrectu0, _ = SS.canonicalize(
+    SS.Tunable(), parameter_values(prob_incorrectu0),
+)
+test_sol = solve(prob_incorrectu0, Rodas5P(), abstol = 1.0e-6, reltol = 1.0e-3)
+
+u0_timedep = [
+    D(x) => 2.0,
+    x => 1.0,
+    y => t,
+    z => 0.0,
+]
+# this ensures that `y => t` is not applied in the adjoint equation
+# If the MTK init is called for the reverse, then `y0` in the backwards
+# pass will be extremely far off and cause an incorrect gradient
+prob_timedepu0 = ODEProblem(
+    sys, u0_timedep, tspan, p, jac = true, guesses = [w2 => 0.0],
+)
+tunables_timedepu0, repack_timedepu0, _ = SS.canonicalize(
+    SS.Tunable(), parameter_values(prob_incorrectu0),
+)
+test_sol = solve(prob_timedepu0, Rodas5P(), abstol = 1.0e-6, reltol = 1.0e-3)
+
+u0_correct = [
+    D(x) => 2.0,
+    x => 1.0,
+    y => 0.0,
+    z => 0.0,
+]
+prob_correctu0 = ODEProblem(
+    sys, u0_correct, tspan, p, jac = true, guesses = [w2 => -1.0],
+)
+tunables_correctu0, repack_correctu0, _ = SS.canonicalize(
+    SS.Tunable(), parameter_values(prob_correctu0),
+)
+test_sol = solve(prob_correctu0, Rodas5P(), abstol = 1.0e-6, reltol = 1.0e-3)
+u0_overdetermined = [
+    D(x) => 2.0,
+    x => 1.0,
+    y => 0.0,
+    z => 0.0,
+    w2 => -1.0,
+]
+prob_overdetermined = ODEProblem(sys, u0_overdetermined, tspan, p, jac = true)
+tunables_overdetermined, repack_overdetermined, _ = SS.canonicalize(
+    SS.Tunable(), parameter_values(prob_overdetermined),
+)
+test_sol = solve(prob_overdetermined, Rodas5P(), abstol = 1.0e-6, reltol = 1.0e-3)
+
+setups = [
+    (prob_correctu0, tunables_correctu0, repack_correctu0, CheckInit()), # Source of truth first
+    (prob_incorrectu0, tunables_incorrectu0, repack_incorrectu0, BrownFullBasicInit()),
+    (prob_incorrectu0, tunables_incorrectu0, repack_incorrectu0, OrdinaryDiffEqCore.DefaultInit()),
+    (prob_incorrectu0, tunables_incorrectu0, repack_incorrectu0, nothing),
+    (prob_timedepu0, tunables_timedepu0, repack_timedepu0, BrownFullBasicInit()),
+    (prob_timedepu0, tunables_timedepu0, repack_timedepu0, OrdinaryDiffEqCore.DefaultInit()),
+    (prob_timedepu0, tunables_timedepu0, repack_timedepu0, nothing),
+    (prob_correctu0, tunables_correctu0, repack_correctu0, BrownFullBasicInit()),
+    (prob_correctu0, tunables_correctu0, repack_correctu0, OrdinaryDiffEqCore.DefaultInit()),
+    (prob_correctu0, tunables_correctu0, repack_correctu0, NoInit()),
+    (prob_correctu0, tunables_correctu0, repack_correctu0, nothing),
+    (prob_overdetermined, tunables_overdetermined, repack_overdetermined, BrownFullBasicInit()),
+    (
+        prob_overdetermined, tunables_overdetermined, repack_overdetermined,
+        OrdinaryDiffEq.OrdinaryDiffEqCore.DefaultInit(),
+    ),
+    (prob_overdetermined, tunables_overdetermined, repack_overdetermined, NoInit()),
+    (prob_overdetermined, tunables_overdetermined, repack_overdetermined, nothing),
+]
+
+# Reverse-mode AD through DAE initialization with SCCNonlinearProblem mutation.
+# Use the same `Duplicated(prob, diprob)` pattern as the SCC init test in
+# `desauty_dae_mwe.jl` (#1454): a plain function `enzyme_solve_loss` (no
+# captured-mutable closure) with the `ODEProblem` passed explicitly as
+# `Duplicated`. `sensealg` is referenced via a module-level `const` so that
+# Enzyme sees it as a `Const`-typed input — passing it as a function argument
+# under `set_runtime_activity(Reverse)` causes Enzyme to promote it to
+# `Duplicated`, which then doesn't match the `solve_up` Enzyme rule signature
+# in `DiffEqBaseEnzymeExt` (which requires `sensealg::Const`). The inner solve
+# pins `Rodas5P()` to avoid polyalgorithm Union dispatch.
+#
+# Status: now `@test` (below). The `MixedDuplicated(::ODESolution)` wall (#1359)
+# is fixed upstream in OrdinaryDiffEq#3700; the `solve_up` init-path issues
+# (`NonConstantKeywordArgException`, the `FunctionWrappersWrapper` return-type
+# mismatch, and the `NonlinearSolvePolyAlgorithm` runtime-activity assertion) are
+# fixed in NonlinearSolveBase (`inactive_kwarg`, the `within_autodiff` wrap-skip,
+# and `inactive_type`); and the repeated-call state corruption caused by the
+# nested `Enzyme.gradient` in `_init_originator_gradient(::EnzymeOriginator)` was
+# an upstream Enzyme bug (EnzymeAD/Enzyme.jl#3139, nested reverse-over-BLAS under
+# `set_runtime_activity`) fixed as of the `Enzyme` floor in `[compat]`, so that
+# init gradient is Enzyme-native again (#1467 routed it through Zygote until the
+# upstream fix landed; #1469).
+#
+# The inner VJP is `EnzymeVJP` — the default `autojacvec` for this in-place MTK
+# DAE — so this is a true Enzyme-over-Enzyme test. `EnzymeVJP._vecjacobian!` runs
+# a *nested* `Enzyme.autodiff` on the MTK-generated DAE RHS whose reverse pass
+# writes the `MTKParameters` `Initials` buffer in place; that used to corrupt the
+# problem across the repeated `Enzyme.autodiff` calls of this `setups` sweep
+# (first call OK, later calls `SingularException` / `CheckInitFailureError`).
+# Fixed in #1507 (the GaussAdjoint adjoint now runs on a copy of the parameters);
+# the underlying Enzyme read-only violation is EnzymeAD/Enzyme.jl#3247.
+const _MTK_SENSEALG = GaussAdjoint(; autojacvec = SciMLSensitivity.EnzymeVJP())
+
+function _mtk_enzyme_solve_loss_with_init(t, prob_, init_)
+    _, repack_, _ = SS.canonicalize(SS.Tunable(), parameter_values(prob_))
+    new_prob = remake(prob_; u0 = prob_.u0, p = repack_(t))
+    new_sol = solve(
+        new_prob, Rodas5P(); initializealg = init_,
+        sensealg = _MTK_SENSEALG, abstol = 1.0e-6, reltol = 1.0e-3,
+    )
+    return sum(new_sol)
+end
+
+function _mtk_enzyme_solve_loss_default_init(t, prob_)
+    _, repack_, _ = SS.canonicalize(SS.Tunable(), parameter_values(prob_))
+    new_prob = remake(prob_; u0 = prob_.u0, p = repack_(t))
+    new_sol = solve(
+        new_prob, Rodas5P();
+        sensealg = _MTK_SENSEALG, abstol = 1.0e-6, reltol = 1.0e-3,
+    )
+    return sum(new_sol)
+end
+
+@test begin
+    grads = map(setups) do setup
+        prob, tunables, repack, init = setup
+        diprob = Enzyme.make_zero(prob)
+        dtunables = zero(tunables)
+        if init === nothing
+            Enzyme.autodiff(
+                Enzyme.set_runtime_activity(Enzyme.Reverse),
+                Enzyme.Const(_mtk_enzyme_solve_loss_default_init), Enzyme.Active,
+                Enzyme.Duplicated(tunables, dtunables),
+                Enzyme.Duplicated(prob, diprob),
+            )
+        else
+            Enzyme.autodiff(
+                Enzyme.set_runtime_activity(Enzyme.Reverse),
+                Enzyme.Const(_mtk_enzyme_solve_loss_with_init), Enzyme.Active,
+                Enzyme.Duplicated(tunables, dtunables),
+                Enzyme.Duplicated(prob, diprob),
+                Enzyme.Const(init),
+            )
+        end
+        dtunables
+    end
+    all(x ≈ grads[1] for x in grads)
+end
+
+@test begin
+    prob_test, tunables_test, repack_test, init_test = setups[1]
+    u0_test = prob_test.u0
+    loss = let prob = prob_test, u0 = u0_test, repack = repack_test,
+            init = init_test, sensealg = sensealg
+
+        tunables_val -> begin
+            new_prob = remake(prob; u0, p = repack(tunables_val))
+            new_sol = solve(
+                new_prob, Rodas5P(); initializealg = init,
+                sensealg, abstol = 1.0e-6, reltol = 1.0e-3,
+            )
+            sum(new_sol)
+        end
+    end
+    rule = Mooncake.build_rrule(loss, tunables_test)
+    _, (_, grad) = Mooncake.value_and_gradient!!(rule, loss, tunables_test)
+    any(!iszero, grad)
+end
+
+# Regression test for #1605: `automatic_sensealg_choice` used to re-canonicalize the
+# already-canonical tunables vector, overwriting the caller's repack (e.g. for
+# `MTKParameters`) with an identity-like `ArrayRepack`. Every VJP probe then called the
+# RHS with the bare tunables vector; any RHS reading a non-tunable portion threw in the
+# probe primal, so the chooser silently fell back to numerical VJPs
+# `GaussAdjoint(autodiff = false, autojacvec = false)`. More than 100 tunables are needed
+# to get past the `ForwardDiffSensitivity` short-circuit and reach the probes.
+let
+    @parameters k[1:128] = 0.01 .* ones(128)
+    @parameters c = 3.0 [tunable = false]
+    @variables x(t) = 1.0
+    @named sys = System([D(x) ~ -c * sum(k) * x], t)
+    sys = mtkcompile(sys)
+    prob = ODEProblem(sys, [], (0.0, 1.0))
+
+    tunables, repack, _ = SS.canonicalize(SS.Tunable(), prob.p)
+    sensealg_mtk = SciMLSensitivity.automatic_sensealg_choice(
+        prob, prob.u0, tunables, true, repack, prob.p
+    )
+    @test sensealg_mtk isa GaussAdjoint
+    @test !(sensealg_mtk.autojacvec isa Bool)
+end
+
+# Same bug class on the `adjoint_sensitivities` entry point: it canonicalized `p` into
+# `tunables`/`repack` but handed the FULL parameter object to `inplace_vjp`, whose probes
+# call `zero(p)` / `similar(p)`. Neither exists for `MTKParameters`, so both the Enzyme and
+# the ReverseDiff probe failed before touching the rhs (with a "Potential performance
+# improvement omitted" warning per call) and every MTK adjoint without an explicit
+# `autojacvec` ran on the numerical VJP.
+let
+    @parameters k[1:128] = 0.01 .* ones(128)
+    @parameters c = 3.0 [tunable = false]
+    @variables x(t) = 1.0
+    @named sys = System([D(x) ~ -c * sum(k) * x], t)
+    sys = mtkcompile(sys)
+    prob = ODEProblem(sys, [], (0.0, 1.0))
+    sol = solve(prob, Tsit5(); abstol = 1.0e-8, reltol = 1.0e-8)
+    dg = (out, u, p, t, i) -> (out .= 1)
+
+    # the probes must succeed silently (the ReverseDiff probe warns on every failure)
+    du0, dp = @test_nowarn adjoint_sensitivities(
+        sol, Tsit5(); t = [1.0], dgdu_discrete = dg, sensealg = InterpolatingAdjoint()
+    )
+    du0_e, dp_e = adjoint_sensitivities(
+        sol, Tsit5(); t = [1.0], dgdu_discrete = dg,
+        sensealg = InterpolatingAdjoint(; autojacvec = EnzymeVJP())
+    )
+    @test du0 ≈ du0_e rtol = 1.0e-6
+    @test dp ≈ dp_e rtol = 1.0e-6
+end
+
+@testset "EnzymeVJP differentiates the bare rhs, not the ODEFunction container" begin
+    # The `ODEFunction` container drags `sys`, `observed` and `initialization_data`
+    # into Enzyme's shadow, which then has to be re-zeroed on every VJP call
+    # (~190 µs per call for a 32-state MTK system). The VJP only calls the rhs.
+    @parameters k = 2.0
+    @variables x(t) = 1.0
+    @named sys = System([D(x) ~ -k * x], t)
+    sys = mtkcompile(sys)
+    prob = ODEProblem(sys, [], (0.0, 1.0))
+    rhs = SciMLSensitivity.enzyme_rhs(prob.f)
+    @test rhs === prob.f.f
+    # no differentiable state left: Enzyme needs no shadow, so `_vecjacobian!`
+    # passes the function `Const` instead of `Duplicated`
+    vf = SciMLBase.Void(rhs)
+    @test Enzyme.make_zero(vf) === vf
+    # and the peeled function must still be the same rhs
+    du = zero(prob.u0)
+    rhs(du, prob.u0, prob.p, 0.0)
+    du_ref = zero(prob.u0)
+    prob.f(du_ref, prob.u0, prob.p, 0.0)
+    @test du == du_ref
+
+    tunables, repack, _ = SS.canonicalize(SS.Tunable(), prob.p)
+    g = Zygote.gradient(tunables) do tunables
+        sum(
+            solve(
+                prob, Tsit5(); p = repack(tunables), saveat = 0.1,
+                abstol = 1.0e-8, reltol = 1.0e-8,
+                sensealg = GaussAdjoint(; autojacvec = SciMLSensitivity.EnzymeVJP())
+            )
+        )
+    end[1]
+    g_fwd = Zygote.gradient(tunables) do tunables
+        sum(
+            solve(
+                prob, Tsit5(); p = repack(tunables), saveat = 0.1,
+                abstol = 1.0e-8, reltol = 1.0e-8, sensealg = ForwardDiffSensitivity()
+            )
+        )
+    end[1]
+    @test g ≈ g_fwd rtol = 1.0e-5
+end

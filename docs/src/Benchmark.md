@@ -6,10 +6,10 @@ From our [recent papers](https://arxiv.org/abs/1812.01892), it's clear that `Enz
 especially when the program is set up to be fully non-allocating mutating functions. Thus for all benchmarking,
 especially with PDEs, this should be done. Neural network libraries don't make use of mutation effectively
 [except for SimpleChains.jl](https://julialang.org/blog/2022/04/simple-chains/), so we recommend creating a
-neural ODE / universal ODE with `ZygoteVJP` and Flux first, but then check the correctness by moving the
-implementation over to SimpleChains and if possible `EnzymeVJP`. This can be an order of magnitude improvement
-(or more) in many situations over all the previous benchmarks using Zygote and Flux, and thus it's
-highly recommended in scenarios that require performance.
+neural ODE / universal ODE with Lux and an out-of-place VJP (`MooncakeVJP` or `ReverseDiffVJP`) first, then
+checking correctness by moving the implementation over to SimpleChains and if possible `EnzymeVJP`. This can
+be an order of magnitude improvement (or more) in many situations, and thus it's highly recommended in
+scenarios that require performance.
 
 ## Vs Torchdiffeq 1 million and less ODEs
 
@@ -33,11 +33,20 @@ at this time.
 Quick summary:
 
   - `BacksolveAdjoint` can be the fastest (but use with caution!); about 25% faster
-  - Using `ZygoteVJP` is faster than other vjp choices with FastDense due to the overloads
+  - `EnzymeVJP` is typically the fastest VJP for mutating / SimpleChains-style networks
+  - `MooncakeVJP` is a strong reverse-mode choice for out-of-place Lux networks
+  - `ReverseDiffVJP(compile = true)` works well for small Lux neural networks
 
 ```julia
-using DiffEqFlux, OrdinaryDiffEq, Flux, Optim, Plots, SciMLSensitivity,
-      Zygote, BenchmarkTools, Random
+import OrdinaryDiffEq as ODE
+import Lux
+import SciMLSensitivity as SMS
+import Enzyme
+import Mooncake
+import DifferentiationInterface as DI
+import BenchmarkTools
+import Random
+import ComponentArrays as CA
 
 u0 = Float32[2.0; 0.0]
 datasize = 30
@@ -49,119 +58,36 @@ function trueODEfunc(du, u, p, t)
     du .= ((u .^ 3)'true_A)'
 end
 
-prob_trueode = ODEProblem(trueODEfunc, u0, tspan)
-ode_data = Array(solve(prob_trueode, Tsit5(), saveat = tsteps))
+prob_trueode = ODE.ODEProblem(trueODEfunc, u0, tspan)
+ode_data = Array(ODE.solve(prob_trueode, ODE.Tsit5(), saveat = tsteps))
 
-dudt2 = FastChain((x, p) -> x .^ 3,
-                  FastDense(2, 50, tanh),
-                  FastDense(50, 2))
+dudt2 = Lux.Chain(x -> x .^ 3, Lux.Dense(2, 50, tanh), Lux.Dense(50, 2))
 Random.seed!(100)
-p = initial_params(dudt2)
 
-prob_neuralode = NeuralODE(dudt2, tspan, Tsit5(), saveat = tsteps)
+for sensealg in (SMS.InterpolatingAdjoint(autojacvec = SMS.EnzymeVJP()),
+    SMS.InterpolatingAdjoint(autojacvec = SMS.MooncakeVJP()),
+    SMS.InterpolatingAdjoint(autojacvec = SMS.ReverseDiffVJP(true)),
+    SMS.BacksolveAdjoint(autojacvec = SMS.ReverseDiffVJP(true)),
+    SMS.BacksolveAdjoint(autojacvec = SMS.EnzymeVJP()),
+    SMS.BacksolveAdjoint(autojacvec = SMS.MooncakeVJP()),
+    SMS.BacksolveAdjoint(autojacvec = SMS.ReverseDiffVJP(false)),
+    SMS.BacksolveAdjoint(autojacvec = SMS.TrackerVJP()),
+    SMS.QuadratureAdjoint(autojacvec = SMS.ReverseDiffVJP(true)),
+    SMS.TrackerAdjoint())
+    prob_neuralode = SMS.NeuralODE(dudt2, tspan, ODE.Tsit5(); saveat = tsteps,
+        sensealg)
+    ps, st = Lux.setup(Random.default_rng(), prob_neuralode)
+    ps = CA.ComponentArray(ps)
 
-function loss_neuralode(p)
-    pred = Array(prob_neuralode(u0, p))
-    loss = sum(abs2, ode_data .- pred)
-    return loss
+    loss_neuralode = function (u0, p, st)
+        pred = Array(first(prob_neuralode(u0, p, st)))
+        loss = sum(abs2, ode_data .- pred)
+        return loss
+    end
+
+    backend = DI.AutoMooncake(; config = Mooncake.Config(; friendly_tangents = true))
+    loss_ps = p -> loss_neuralode(u0, p, st)
+    t = BenchmarkTools.@belapsed DI.gradient($loss_ps, $backend, $ps)
+    println("$(sensealg) took $(t)s")
 end
-
-@btime Zygote.gradient(loss_neuralode, p)
-# 2.709 ms (56506 allocations: 6.62 MiB)
-
-prob_neuralode_interpolating = NeuralODE(dudt2, tspan, Tsit5(), saveat = tsteps,
-                                         sensealg = InterpolatingAdjoint(autojacvec = ReverseDiffVJP(true)))
-
-function loss_neuralode_interpolating(p)
-    pred = Array(prob_neuralode_interpolating(u0, p))
-    loss = sum(abs2, ode_data .- pred)
-    return loss
-end
-
-@btime Zygote.gradient(loss_neuralode_interpolating, p)
-# 5.501 ms (103835 allocations: 2.57 MiB)
-
-prob_neuralode_interpolating_zygote = NeuralODE(dudt2, tspan, Tsit5(), saveat = tsteps,
-                                                sensealg = InterpolatingAdjoint(autojacvec = ZygoteVJP()))
-
-function loss_neuralode_interpolating_zygote(p)
-    pred = Array(prob_neuralode_interpolating_zygote(u0, p))
-    loss = sum(abs2, ode_data .- pred)
-    return loss
-end
-
-@btime Zygote.gradient(loss_neuralode_interpolating_zygote, p)
-# 2.899 ms (56150 allocations: 6.61 MiB)
-
-prob_neuralode_backsolve = NeuralODE(dudt2, tspan, Tsit5(), saveat = tsteps,
-                                     sensealg = BacksolveAdjoint(autojacvec = ReverseDiffVJP(true)))
-
-function loss_neuralode_backsolve(p)
-    pred = Array(prob_neuralode_backsolve(u0, p))
-    loss = sum(abs2, ode_data .- pred)
-    return loss
-end
-
-@btime Zygote.gradient(loss_neuralode_backsolve, p)
-# 4.871 ms (85855 allocations: 2.20 MiB)
-
-prob_neuralode_quad = NeuralODE(dudt2, tspan, Tsit5(), saveat = tsteps,
-                                sensealg = QuadratureAdjoint(autojacvec = ReverseDiffVJP(true)))
-
-function loss_neuralode_quad(p)
-    pred = Array(prob_neuralode_quad(u0, p))
-    loss = sum(abs2, ode_data .- pred)
-    return loss
-end
-
-@btime Zygote.gradient(loss_neuralode_quad, p)
-# 11.748 ms (79549 allocations: 3.87 MiB)
-
-prob_neuralode_backsolve_tracker = NeuralODE(dudt2, tspan, Tsit5(), saveat = tsteps,
-                                             sensealg = BacksolveAdjoint(autojacvec = TrackerVJP()))
-
-function loss_neuralode_backsolve_tracker(p)
-    pred = Array(prob_neuralode_backsolve_tracker(u0, p))
-    loss = sum(abs2, ode_data .- pred)
-    return loss
-end
-
-@btime Zygote.gradient(loss_neuralode_backsolve_tracker, p)
-# 27.604 ms (186143 allocations: 12.22 MiB)
-
-prob_neuralode_backsolve_zygote = NeuralODE(dudt2, tspan, Tsit5(), saveat = tsteps,
-                                            sensealg = BacksolveAdjoint(autojacvec = ZygoteVJP()))
-
-function loss_neuralode_backsolve_zygote(p)
-    pred = Array(prob_neuralode_backsolve_zygote(u0, p))
-    loss = sum(abs2, ode_data .- pred)
-    return loss
-end
-
-@btime Zygote.gradient(loss_neuralode_backsolve_zygote, p)
-# 2.091 ms (49883 allocations: 6.28 MiB)
-
-prob_neuralode_backsolve_false = NeuralODE(dudt2, tspan, Tsit5(), saveat = tsteps,
-                                           sensealg = BacksolveAdjoint(autojacvec = ReverseDiffVJP(false)))
-
-function loss_neuralode_backsolve_false(p)
-    pred = Array(prob_neuralode_backsolve_false(u0, p))
-    loss = sum(abs2, ode_data .- pred)
-    return loss
-end
-
-@btime Zygote.gradient(loss_neuralode_backsolve_false, p)
-# 4.822 ms (9956 allocations: 1.03 MiB)
-
-prob_neuralode_tracker = NeuralODE(dudt2, tspan, Tsit5(), saveat = tsteps,
-                                   sensealg = TrackerAdjoint())
-
-function loss_neuralode_tracker(p)
-    pred = Array(prob_neuralode_tracker(u0, p))
-    loss = sum(abs2, ode_data .- pred)
-    return loss
-end
-
-@btime Zygote.gradient(loss_neuralode_tracker, p)
-# 12.614 ms (76346 allocations: 3.12 MiB)
 ```

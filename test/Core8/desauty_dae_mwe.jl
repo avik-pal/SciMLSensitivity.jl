@@ -1,0 +1,189 @@
+using Test
+using ModelingToolkit, OrdinaryDiffEq
+using ModelingToolkit: t_nounits as t, D_nounits as D
+import SciMLStructures as SS
+import SciMLSensitivity
+import SciMLBase
+using SymbolicIndexingInterface
+using FiniteDiff
+using ForwardDiff
+using Tracker
+using Enzyme
+using Mooncake
+using NonlinearSolve: NewtonRaphson
+
+# DAE with nonlinear algebraic constraints forming an SCC chain.
+# Inspired by the De Sauty bridge DAE but written as a flat system
+# (no ModelingToolkitStandardLibrary dependency).
+#
+# D(x) = a*x + y + z        (ODE)
+# 0 = y^3 + y - b*x         (algebraic: y from x, parameter b)
+# 0 = z^3 + z - c*y         (algebraic: z from y, parameter c)
+#
+# The cubic equations can't be eliminated by structural_simplify.
+# With use_scc=true: init is SCCNonlinearProblem with 2 sub-problems
+# With use_scc=false: init is NonlinearProblem
+#
+# Exact initial values with x(0)=1, b=2, c=1.5:
+#   y^3 + y = 2 → y = 1 (exact)
+#   z^3 + z = 1.5 → z ≈ 0.8612
+
+@parameters a b c
+@variables x(t) y(t) z(t)
+
+eqs = [
+    D(x) ~ a * x + y + z,
+    0 ~ y^3 + y - b * x,
+    0 ~ z^3 + z - c * y,
+]
+
+@mtkbuild sys = ODESystem(eqs, t)
+
+@testset "DAE with SCC Initialization" begin
+    @testset "use_scc = $use_scc" for use_scc in (false, true)
+        prob = ODEProblem(
+            sys,
+            [x => 1.0],
+            (0.0, 0.1),
+            [a => -0.5, b => 2.0, c => 1.5],
+            guesses = [y => 1.0, z => 0.5];
+            use_scc,
+        )
+
+        # Verify initialization problem type
+        idata = prob.f.initialization_data
+        init_type_str = string(typeof(idata.initializeprob))
+        if use_scc
+            @test occursin("SCC", init_type_str)
+        else
+            @test !occursin("SCC", init_type_str)
+        end
+
+        # Forward solve
+        sol = solve(prob, Rodas5P(); abstol = 1.0e-12, reltol = 1.0e-12)
+        @test SciMLBase.successful_retcode(sol)
+        @test sol[y, 1] ≈ 1.0 atol = 1.0e-8
+        @test 0.85 < sol[z, 1] < 0.87
+
+        tunables, repack, _ = SS.canonicalize(SS.Tunable(), parameter_values(prob))
+
+        # FiniteDiff ground truth for full ODE solve
+        loss = let prob = prob, repack = repack
+            p -> begin
+                new_prob = remake(prob; p = repack(p))
+                sol = solve(new_prob, Rodas5P(); abstol = 1.0e-12, reltol = 1.0e-12)
+                sum(sol)
+            end
+        end
+        fd_grad = FiniteDiff.finite_difference_gradient(loss, tunables)
+        @test any(!iszero, fd_grad)
+
+        # Direct init problem differentiation
+        iprob = idata.initializeprob
+        itunables, irepack, _ = SS.canonicalize(
+            SS.Tunable(), parameter_values(iprob),
+        )
+
+        init_loss = let iprob = iprob, irepack = irepack
+            p -> begin
+                iprob2 = remake(iprob, p = irepack(p))
+                sol = solve(iprob2)
+                sum(sol.u)
+            end
+        end
+
+        fd_init_grad = FiniteDiff.finite_difference_gradient(init_loss, itunables)
+        @test any(!iszero, fd_init_grad)
+
+        @testset "ForwardDiff through init" begin
+            if use_scc
+                # Broken: SCCNonlinearProblem solver doesn't support ForwardDiff.Dual numbers.
+                # Error: MethodError: no method matching Float64(::ForwardDiff.Dual{...})
+                # in the explicit parameter propagation between sub-problem solves.
+                @test_broken begin
+                    fwd_init = ForwardDiff.gradient(init_loss, itunables)
+                    isapprox(fwd_init, fd_init_grad, rtol = 0.05)
+                end
+            else
+                fwd_init = ForwardDiff.gradient(init_loss, itunables)
+                @test isapprox(fwd_init, fd_init_grad, rtol = 0.05)
+            end
+        end
+
+        @testset "ForwardDiff through ODE solve" begin
+            # Broken: ForwardDiff through full ODE solve with DAE initialization
+            # fails for both use_scc cases due to type promotion issues in
+            # the initialization path.
+            @test_broken begin
+                fwd_grad = ForwardDiff.gradient(loss, tunables)
+                isapprox(fwd_grad, fd_grad, rtol = 0.05)
+            end
+        end
+
+        @testset "Enzyme through init" begin
+            # `Enzyme.gradient(Const(closure), tunables)` does not allocate
+            # shadows for the closure's captures, so when the closure captures
+            # a mutable `iprob` (whose `iprob.p.caches` is shared via the
+            # `SciMLStructures.replace` `@set!` repack and then mutated by
+            # the inner `solve!`), the derivative info carried by those cache
+            # writes has nowhere to land and is silently dropped. The
+            # idiomatic Enzyme pattern is to express the loss as a plain
+            # function whose captured mutable state is passed as an explicit
+            # `Duplicated` argument. We also reconstruct `irepack` *inside*
+            # the loss from the duplicated `iprob_`, so its captured
+            # parameter template shares the Enzyme shadow.
+            #
+            # The inner `solve` pins `NewtonRaphson()` explicitly so Enzyme's
+            # type analysis does not trip on the polyalgorithm Union
+            # NonlinearSolve would otherwise dispatch through. The
+            # previously-reported `EnzymeMutabilityException` on the mutable
+            # closure capture is correct upstream behavior per
+            # EnzymeAD/Enzyme.jl#3117 — annotating with `Const` is the fix.
+            function enzyme_init_loss(t, iprob_)
+                _, irepack_, _ = SS.canonicalize(
+                    SS.Tunable(), parameter_values(iprob_),
+                )
+                iprob2 = remake(iprob_, p = irepack_(t))
+                sol = solve(iprob2, NewtonRaphson())
+                return sum(sol.u)
+            end
+            diprob = Enzyme.make_zero(iprob)
+            dtunables = zero(itunables)
+            Enzyme.autodiff(
+                Enzyme.set_runtime_activity(Enzyme.Reverse),
+                Enzyme.Const(enzyme_init_loss),
+                Enzyme.Active,
+                Enzyme.Duplicated(itunables, dtunables),
+                Enzyme.Duplicated(iprob, diprob),
+            )
+            @test !iszero(sum(dtunables))
+            @test isapprox(dtunables, fd_init_grad, rtol = 0.05)
+        end
+
+        @testset "Mooncake through init" begin
+            rule = Mooncake.build_rrule(init_loss, itunables)
+            _, (_, igs) = Mooncake.value_and_gradient!!(
+                rule, init_loss, itunables,
+            )
+            @test !iszero(sum(igs))
+            @test isapprox(igs, fd_init_grad, rtol = 0.05)
+        end
+
+        @testset "Tracker + GaussAdjoint through ODE solve" begin
+            # Broken: MTK's GetUpdatedU0 can't handle TrackedReal{Float64} in remake path.
+            # Error: MethodError: no method matching Float64(::Tracker.TrackedReal{Float64})
+            # in copyto_unaliased! when updating u0 from parameter initials.
+            sensealg = SciMLSensitivity.GaussAdjoint(
+                autojacvec = SciMLSensitivity.EnzymeVJP(),
+            )
+            @test_broken begin
+                gs = Tracker.gradient(tunables) do tunables
+                    new_prob = remake(prob; p = repack(tunables))
+                    sol = solve(new_prob, Rodas5P(); sensealg)
+                    sum(sol)
+                end
+                any(!iszero, gs[1])
+            end
+        end
+    end
+end

@@ -1,14 +1,8 @@
 struct SteadyStateAdjointSensitivityFunction{
-                                             C <: AdjointDiffCache,
-                                             Alg <: SteadyStateAdjoint,
-                                             uType,
-                                             SType,
-                                             fType <: ODEFunction,
-                                             CV,
-                                             λType,
-                                             VJPType,
-                                             LS
-                                             } <: SensitivityFunction
+        C <: AdjointDiffCache,
+        Alg <: SteadyStateAdjoint, uType, SType, fType <: ODEFunction, CV, λType, VJPType,
+        LS,
+    } <: SensitivityFunction
     diffcache::C
     sensealg::Alg
     y::uType
@@ -20,71 +14,80 @@ struct SteadyStateAdjointSensitivityFunction{
     linsolve::LS
 end
 
-function Base.show(io::IO,
-                   t::Type{
-                           SteadyStateAdjointSensitivityFunction{C, Alg, uType, SType,
-                                                                 fType, CV, λType, VJPType,
-                                                                 LS}}) where {C, Alg, uType,
-                                                                              SType, fType,
-                                                                              CV, λType,
-                                                                              VJPType, LS}
-    if TruncatedStacktraces.VERBOSE[]
-        print(io,
-              "SteadyStateAdjointSensitivityFunction{$C,$Alg,$uType,$SType,$fType,$CV,$λType,$VJPType,$LS}")
-    else
-        print(io, "SteadyStateAdjointSensitivityFunction{…}")
-    end
-end
+function SteadyStateAdjointSensitivityFunction(
+        g, sensealg, alg, sol, dgdu, dgdp, f,
+        colorvec, needs_jac
+    )
+    (; p, u0) = sol.prob
 
-function SteadyStateAdjointSensitivityFunction(g, sensealg, alg, sol, dgdu, dgdp, f,
-                                               colorvec, needs_jac)
-    @unpack p, u0 = sol.prob
-
-    diffcache, y = adjointdiffcache(g, sensealg, false, sol, dgdu, dgdp, f, alg;
-                                    quad = false, needs_jac)
+    # When diff_tunables = Val(false), use the full parameter object so
+    # the VJP includes gradients w.r.t. all parameter components.
+    _use_full_p = sensealg.diff_tunables isa Val{false} &&
+        isscimlstructure(p) && !(p isa AbstractArray)
+    diffcache,
+        y = adjointdiffcache(
+        g, sensealg, false, sol, dgdu, dgdp, f, alg;
+        quad = false, needs_jac, use_full_p = _use_full_p
+    )
 
     λ = zero(y)
     linsolve = needs_jac ? nothing : sensealg.linsolve
-    vjp = similar(λ, length(p))
+    vjp = allocate_vjp(λ, diffcache.tunables)
 
-    SteadyStateAdjointSensitivityFunction(diffcache, sensealg, y, sol, f, colorvec, λ, vjp,
-                                          linsolve)
+    return SteadyStateAdjointSensitivityFunction(
+        diffcache, sensealg, y, sol, f, colorvec,
+        λ, vjp, linsolve
+    )
 end
 
-@noinline function SteadyStateAdjointProblem(sol, sensealg::SteadyStateAdjoint, alg,
-                                             dgdu::DG1 = nothing, dgdp::DG2 = nothing,
-                                             g::G = nothing; kwargs...) where {DG1, DG2, G}
-    @unpack f, p, u0 = sol.prob
+@inline __needs_concrete_A(l) = LinearSolve.needs_concrete_A(l)
+@inline __needs_concrete_A(::Nothing) = false
 
-    if sol.prob isa NonlinearProblem
+@noinline function SteadyStateAdjointProblem(
+        sol, sensealg::SteadyStateAdjoint, alg,
+        dgdu::DG1 = nothing, dgdp::DG2 = nothing, g::G = nothing;
+        kwargs...
+    ) where {DG1, DG2, G}
+    (; f, p, u0) = sol.prob
+
+    if sol.prob isa AbstractNonlinearProblem
+        # Strip FunctionWrappers (AutoSpecializeCallable) from NonlinearFunction
+        # before converting to ODEFunction, since the wrapped function only supports
+        # pre-compiled type combinations and breaks autodiff with Dual types.
+        if hasproperty(f.f, :orig)
+            f = unwrapped_f(f, f.f.orig)
+        end
         f = ODEFunction(f)
     end
 
     dgdu === nothing && dgdp === nothing && g === nothing &&
         error("Either `dgdu`, `dgdp`, or `g` must be specified.")
 
-    # TODO: What is the correct heuristic? Can we afford to compute Jacobian for
-    #       cases where the length(u0) > 50 and if yes till what threshold
-    needs_jac = if sensealg.linsolve === nothing
-        length(u0) <= 50
-    else
-        LinearSolve.needs_concrete_A(sensealg.linsolve)
-    end
+    needs_jac = ifelse(
+        has_adjoint(f), false,
+        ifelse(
+            sensealg.linsolve === nothing, isnothing(u0) || length(u0) ≤ 50,
+            __needs_concrete_A(sensealg.linsolve)
+        )
+    )
 
-    p === DiffEqBase.NullParameters() &&
+    p === SciMLBase.NullParameters() &&
         error("Your model does not have parameters, and thus it is impossible to calculate the derivative of the solution with respect to the parameters. Your model must have parameters to use parameter sensitivity calculations!")
 
-    sense = SteadyStateAdjointSensitivityFunction(g, sensealg, alg, sol, dgdu, dgdp,
-                                                  f, f.colorvec, needs_jac)
-    @unpack diffcache, y, sol, λ, vjp, linsolve = sense
-
+    sense = SteadyStateAdjointSensitivityFunction(
+        g, sensealg, alg, sol, dgdu, dgdp,
+        f, f.colorvec, needs_jac
+    )
+    (; diffcache, y, sol, λ, vjp, linsolve) = sense
     if needs_jac
-        if DiffEqBase.has_jac(f)
+        if SciMLBase.has_jac(f)
             f.jac(diffcache.J, y, p, nothing)
         else
             if DiffEqBase.isinplace(sol.prob)
-                jacobian!(diffcache.J, diffcache.uf, y, diffcache.f_cache,
-                          sensealg, diffcache.jac_config)
+                jacobian!(
+                    diffcache.J, diffcache.uf, y, diffcache.f_cache,
+                    sensealg, diffcache.jac_config
+                )
             else
                 diffcache.J .= jacobian(diffcache.uf, y, sensealg)
             end
@@ -103,71 +106,86 @@ end
     else
         if g !== nothing
             if dgdp_val !== nothing
-                gradient!(vec(dgdu_val), diffcache.g[1], y, sensealg,
-                          diffcache.g_grad_config[1])
+                gradient!(
+                    vec(dgdu_val), diffcache.g[1], y, sensealg,
+                    diffcache.g_grad_config[1]
+                )
             else
                 gradient!(vec(dgdu_val), diffcache.g, y, sensealg, diffcache.g_grad_config)
             end
         end
     end
 
-    if !needs_jac
-        # TODO: FixedVecJacOperator should respect the `autojacvec` of the algorithm
-        operator = FixedVecJacOperator(f, y, p, Val(DiffEqBase.isinplace(sol.prob)))
-        linear_problem = LinearProblem(operator, vec(dgdu_val); u0 = vec(λ))
+    if !needs_jac && !isempty(y)
+        # Current SciMLJacobianOperators requires specifying the problem as a NonlinearProblem
+        usize = size(y)
+        if SciMLBase.isinplace(f)
+            nlfunc = NonlinearFunction{true}(
+                (
+                    du, u,
+                    p,
+                ) -> unwrapped_f(f)(
+                    reshape(u, usize), reshape(u, usize), p, nothing
+                )
+            )
+        else
+            nlfunc = NonlinearFunction{false}(
+                (
+                    u, p,
+                ) -> unwrapped_f(f)(
+                    reshape(u, usize), p, nothing
+                )
+            )
+        end
+        nlprob = NonlinearProblem(nlfunc, vec(λ), p)
+        operator = VecJacOperator(
+            nlprob, vec(y), (λ); autodiff = get_autodiff_from_vjp(sensealg.autojacvec)
+        )
+        soperator = StatefulJacobianOperator(operator, vec(y), p)
+        linear_problem = LinearProblem(soperator, vec(dgdu_val); u0 = vec(λ))
+        solve(
+            linear_problem, linsolve; alias = LinearAliasSpecifier(alias_A = true),
+            sensealg.linsolve_kwargs...
+        )
     else
-        linear_problem = LinearProblem(diffcache.J', vec(dgdu_val'); u0 = vec(λ))
+        if !isempty(y)
+            J_ = diffcache.J isa PreallocationTools.DiffCache ? diffcache.J.du' :
+                diffcache.J'
+            linear_problem = LinearProblem(J_, vec(dgdu_val'); u0 = vec(λ))
+            solve(
+                linear_problem, linsolve; alias = LinearAliasSpecifier(alias_A = true),
+                sensealg.linsolve_kwargs...
+            ) # u is vec(λ)
+        end
     end
 
-    # Zygote pullback function won't work with deepcopy
-    solve(linear_problem, linsolve; alias_A = true) # u is vec(λ)
-
     try
-        vecjacobian!(vec(dgdu_val), y, λ, p, nothing, sense; dgrad = vjp, dy = nothing)
+        if !isempty(y)
+            vecjacobian!(vec(dgdu_val), y, λ, p, nothing, sense; dgrad = vjp, dy = nothing)
+        end
     catch e
         if sense.sensealg.autojacvec === nothing
             @warn "Automatic AD choice of autojacvec failed in nonlinear solve adjoint, failing back to ODE adjoint + numerical vjp"
-            vecjacobian!(vec(dgdu_val), y, λ, p, nothing, false, dgrad = vjp,
-                         dy = nothing)
+            vecjacobian!(vec(dgdu_val), y, λ, p, nothing, false, dgrad = vjp, dy = nothing)
         else
             @warn "AD choice of autojacvec failed in nonlinear solve adjoint"
             throw(e)
         end
     end
 
+
     if g !== nothing || dgdp !== nothing
         # compute del g/del p
         if dgdp !== nothing
             dgdp(dgdp_val, y, p, nothing, nothing)
         else
-            @unpack g_grad_config = diffcache
+            (; g_grad_config) = diffcache
             gradient!(dgdp_val, diffcache.g[2], p, sensealg, g_grad_config[2])
         end
-        dgdp_val .-= vjp
+        recursive_sub!(dgdp_val, vjp)
         return dgdp_val
     else
-        vjp .*= -1
+        recursive_neg!(vjp)
         return vjp
     end
-end
-
-function FixedVecJacOperator(f_in, y, p, ::Val{false})
-    # NOTE: Zygote doesn't support inplace
-    input, f = Zygote.pullback(x -> f_in(x, p, nothing), y)
-    output = f(input)[1]
-    function f_operator!(du, u, p, t)
-        du .= vec(f(reshape(u, size(input)))[1])
-        return du
-    end
-    op = FunctionOperator(f_operator!, vec(input), vec(output))
-    return op
-end
-
-function FixedVecJacOperator(f, y, p, ::Val{true})
-    function f_operator!(du, u, p, t)
-        num_vecjac!(du, (_du, _u) -> f(reshape(_du, size(y)), _u, p, t),
-                    y, reshape(u, size(y)))
-        return du
-    end
-    return FunctionOperator(f_operator!, vec(y); p)
 end

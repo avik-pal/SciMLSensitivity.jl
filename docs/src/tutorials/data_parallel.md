@@ -17,7 +17,13 @@ matrix multiplication). Thus for example, with `Chain` we can
 define an ODE:
 
 ```@example dataparallel
-using Lux, DiffEqFlux, DifferentialEquations, CUDA, Random
+import Lux
+import OrdinaryDiffEq as ODE
+import LuxCUDA
+import Random
+
+gdev = Lux.gpu_device()
+
 rng = Random.default_rng()
 
 dudt = Lux.Chain(Lux.Dense(2, 50, tanh), Lux.Dense(50, 2))
@@ -29,8 +35,8 @@ and we can solve this ODE where the initial condition is a vector:
 
 ```@example dataparallel
 u0 = Float32[2.0; 0.0]
-prob = ODEProblem(f, u0, (0.0f0, 1.0f0), p)
-solve(prob, Tsit5())
+prob = ODE.ODEProblem(f, u0, (0.0f0, 1.0f0), p)
+ODE.solve(prob, ODE.Tsit5())
 ```
 
 or we can solve this ODE where the initial condition is a matrix, where
@@ -39,8 +45,8 @@ each column is an independent system:
 ```@example dataparallel
 u0 = Float32.([0 1 2
                0 0 0])
-prob = ODEProblem(f, u0, (0.0f0, 1.0f0), p)
-solve(prob, Tsit5())
+prob = ODE.ODEProblem(f, u0, (0.0f0, 1.0f0), p)
+ODE.solve(prob, ODE.Tsit5())
 ```
 
 On the CPU this will multithread across the system (due to BLAS) and
@@ -51,13 +57,14 @@ GPU:
 ```@example dataparallel
 xs = Float32.([0 1 2
                0 0 0])
-prob = ODEProblem(f, Lux.gpu(u0), (0.0f0, 1.0f0), Lux.gpu(p))
-solve(prob, Tsit5())
+prob = ODE.ODEProblem(f, gdev(u0), (0.0f0, 1.0f0), gdev(p))
+ODE.solve(prob, ODE.Tsit5())
 ```
 
 This method of parallelism is optimal if all the operations are
 linear algebra operations, such as a neural ODE. Thus this method of
-parallelism is demonstrated in the [MNIST tutorial](@ref mnist).
+parallelism is demonstrated in the
+[MNIST tutorial](https://docs.sciml.ai/DiffEqFlux/stable/examples/mnist_neural_ode/).
 
 However, this method of parallelism has many limitations. First of all,
 the ODE function is required to be written in a way that is independent
@@ -82,45 +89,51 @@ interface.
 The following is a full copy-paste example for the multithreading.
 Distributed and GPU minibatching are described below.
 
+
 ```@example dataparallel
-using DifferentialEquations, Optimization, OptimizationFlux
+import OrdinaryDiffEq as ODE
+import SciMLBase
+import Optimization as OPT
+import OptimizationOptimisers as OPO
+import SciMLSensitivity as SMS
+import Enzyme
 pa = [1.0]
 u0 = [3.0]
 θ = [u0; pa]
 
 function model1(θ, ensemble)
-    prob = ODEProblem((u, p, t) -> 1.01u .* p, [θ[1]], (0.0, 1.0), [θ[2]])
+    prob = ODE.ODEProblem((u, p, t) -> 1.01u .* p, [θ[1]], (0.0, 1.0), [θ[2]])
 
-    function prob_func(prob, i, repeat)
-        remake(prob, u0 = 0.5 .+ i / 100 .* prob.u0)
+    function prob_func(prob, ctx)
+        ODE.remake(prob, u0 = 0.5 .+ ctx.sim_id / 100 .* prob.u0)
     end
 
-    ensemble_prob = EnsembleProblem(prob, prob_func = prob_func)
-    sim = solve(ensemble_prob, Tsit5(), ensemble, saveat = 0.1, trajectories = 100)
+    ensemble_prob = ODE.EnsembleProblem(prob; prob_func)
+    sim = ODE.solve(ensemble_prob, ODE.Tsit5(), ensemble, saveat = 0.1, trajectories = 100)
 end
 
 # loss function
-loss_serial(θ) = sum(abs2, 1.0 .- Array(model1(θ, EnsembleSerial())))
-loss_threaded(θ) = sum(abs2, 1.0 .- Array(model1(θ, EnsembleThreads())))
+loss_serial(θ) = sum(abs2, 1.0 .- Array(model1(θ, SciMLBase.EnsembleSerial())))
+loss_threaded(θ) = sum(abs2, 1.0 .- Array(model1(θ, SciMLBase.EnsembleThreads())))
 
 callback = function (θ, l) # callback function to observe training
     @show l
     false
 end
 
-opt = ADAM(0.1)
+opt = OPO.Adam(0.1)
 l1 = loss_serial(θ)
 
-adtype = Optimization.AutoZygote()
-optf = Optimization.OptimizationFunction((x, p) -> loss_serial(x), adtype)
-optprob = Optimization.OptimizationProblem(optf, θ)
+adtype = OPT.AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+optf = OPT.OptimizationFunction((x, p) -> loss_serial(x), adtype)
+optprob = OPT.OptimizationProblem(optf, θ)
 
-res_serial = Optimization.solve(optprob, opt; callback = callback, maxiters = 100)
+res_serial = OPT.solve(optprob, opt; callback, maxiters = 100)
 
-optf2 = Optimization.OptimizationFunction((x, p) -> loss_threaded(x), adtype)
-optprob2 = Optimization.OptimizationProblem(optf2, θ)
+optf2 = OPT.OptimizationFunction((x, p) -> loss_threaded(x), adtype)
+optprob2 = OPT.OptimizationProblem(optf2, θ)
 
-res_threads = Optimization.solve(optprob2, opt; callback = callback, maxiters = 100)
+res_threads = OPT.solve(optprob2, opt; callback, maxiters = 100)
 ```
 
 ## Multithreaded Batching In-Depth
@@ -134,39 +147,42 @@ first define a prototype `DEProblem`. Here, we use the following
 `ODEProblem` as our base:
 
 ```@example dataparallel
-prob = ODEProblem((u, p, t) -> 1.01u .* p, [θ[1]], (0.0, 1.0), [θ[2]])
+prob = ODE.ODEProblem((u, p, t) -> 1.01u .* p, [θ[1]], (0.0, 1.0), [θ[2]])
 ```
 
 In the `prob_func` we define how to build a new problem based on the
 base problem. In this case, we want to change `u0` by a constant, i.e.
-`0.5 .+ i/100 .* prob.u0` for different trajectories labelled by `i`.
+`0.5 .+ ctx.sim_id/100 .* prob.u0` for different trajectories, where
+`ctx.sim_id` is the trajectory index carried by the `EnsembleContext`.
 Thus we use the [remake function from the problem interface](https://docs.sciml.ai/DiffEqDocs/stable/basics/problem/#Modification-of-problem-types) to do so:
 
 ```@example dataparallel
-function prob_func(prob, i, repeat)
-    remake(prob, u0 = 0.5 .+ i / 100 .* prob.u0)
+function prob_func(prob, ctx)
+    ODE.remake(prob, u0 = 0.5 .+ ctx.sim_id / 100 .* prob.u0)
 end
 ```
 
 We now build the `EnsembleProblem` with this basis:
 
 ```@example dataparallel
-ensemble_prob = EnsembleProblem(prob, prob_func = prob_func)
+ensemble_prob = ODE.EnsembleProblem(prob; prob_func)
 ```
 
 Now, to solve an ensemble problem, we need to choose an ensembling
 algorithm and choose the number of trajectories to solve. Here let's
-solve this in serial with 100 trajectories. Note that `i` will thus run
-from `1:100`.
+solve this in serial with 100 trajectories. Note that `ctx.sim_id` will
+thus run from `1:100`.
 
 ```@example dataparallel
-sim = solve(ensemble_prob, Tsit5(), EnsembleSerial(), saveat = 0.1, trajectories = 100)
+sim = ODE.solve(
+    ensemble_prob, ODE.Tsit5(), SciMLBase.EnsembleSerial(), saveat = 0.1, trajectories = 100)
 ```
 
 and thus running in multithreading would be:
 
 ```@example dataparallel
-sim = solve(ensemble_prob, Tsit5(), EnsembleThreads(), saveat = 0.1, trajectories = 100)
+sim = ODE.solve(
+    ensemble_prob, ODE.Tsit5(), SciMLBase.EnsembleThreads(), saveat = 0.1, trajectories = 100)
 ```
 
 This whole mechanism is differentiable, so we then put it in a training
@@ -183,7 +199,8 @@ Changing to distributed computing is very simple as well. The setup is
 all the same, except you utilize `EnsembleDistributed` as the ensembler:
 
 ```@example dataparallel
-sim = solve(ensemble_prob, Tsit5(), EnsembleDistributed(), saveat = 0.1, trajectories = 100)
+sim = ODE.solve(
+    ensemble_prob, ODE.Tsit5(), SciMLBase.EnsembleDistributed(), saveat = 0.1, trajectories = 100)
 ```
 
 Note that for this to work, you need to ensure that your processes are
@@ -194,11 +211,14 @@ that all the required functions are defined on the worker processes.
 The following is a full example of a distributed batching setup:
 
 ```julia
-using Distributed
-addprocs(4)
+import Distributed
+Distributed.addprocs(4)
 
-@everywhere begin
-    using DifferentialEquations, Optimization, OptimizationFlux
+Distributed.@everywhere begin
+    import OrdinaryDiffEq as ODE
+    import SciMLBase
+    import Optimization as OPT
+    import OptimizationOptimisers as OPO
     function f(u, p, t)
         1.01u .* p
     end
@@ -209,14 +229,14 @@ u0 = [3.0]
 θ = [u0; pa]
 
 function model1(θ, ensemble)
-    prob = ODEProblem(f, [θ[1]], (0.0, 1.0), [θ[2]])
+    prob = ODE.ODEProblem(f, [θ[1]], (0.0, 1.0), [θ[2]])
 
-    function prob_func(prob, i, repeat)
-        remake(prob, u0 = 0.5 .+ i / 100 .* prob.u0)
+    function prob_func(prob, ctx)
+        ODE.remake(prob, u0 = 0.5 .+ ctx.sim_id / 100 .* prob.u0)
     end
 
-    ensemble_prob = EnsembleProblem(prob, prob_func = prob_func)
-    sim = solve(ensemble_prob, Tsit5(), ensemble, saveat = 0.1, trajectories = 100)
+    ensemble_prob = ODE.EnsembleProblem(prob; prob_func)
+    sim = ODE.solve(ensemble_prob, ODE.Tsit5(), ensemble, saveat = 0.1, trajectories = 100)
 end
 
 callback = function (θ, l) # callback function to observe training
@@ -224,18 +244,18 @@ callback = function (θ, l) # callback function to observe training
     false
 end
 
-opt = ADAM(0.1)
-loss_distributed(θ) = sum(abs2, 1.0 .- Array(model1(θ, EnsembleDistributed())))
+opt = OPO.Adam(0.1)
+loss_distributed(θ) = sum(abs2, 1.0 .- Array(model1(θ, SciMLBase.EnsembleDistributed())))
 l1 = loss_distributed(θ)
 
-adtype = Optimization.AutoZygote()
-optf = Optimization.OptimizationFunction((x, p) -> loss_distributed(x), adtype)
-optprob = Optimization.OptimizationProblem(optf, θ)
+adtype = OPT.AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+optf = OPT.OptimizationFunction((x, p) -> loss_distributed(x), adtype)
+optprob = OPT.OptimizationProblem(optf, θ)
 
-res_distributed = Optimization.solve(optprob, opt; callback = callback, maxiters = 100)
+res_distributed = OPT.solve(optprob, opt; callback, maxiters = 100)
 ```
 
-And note that only `addprocs(4)` needs to be changed in order to make
+And note that only `Distributed.addprocs(4)` needs to be changed in order to make
 this demo run across a cluster. For more information on adding processes
 to a cluster, check out [ClusterManagers.jl](https://github.com/JuliaParallel/ClusterManagers.jl).
 
@@ -251,9 +271,14 @@ The following is an example of minibatch ensemble parallelism across
 a GPU:
 
 ```julia
-using DifferentialEquations, Optimization, OptimizationFlux, DiffEqGPU
+import DifferentialEquations as DE
+import Optimization as OPT
+import OptimizationOptimisers as OPO
+import DiffEqGPU
 function f(du, u, p, t)
-    @inbounds begin du[1] = 1.01 * u[1] * p[1] * p[2] end
+    @inbounds begin
+        du[1] = 1.01 * u[1] * p[1] * p[2]
+    end
 end
 
 pa = [1.0]
@@ -261,14 +286,14 @@ u0 = [3.0]
 θ = [u0; pa]
 
 function model1(θ, ensemble)
-    prob = ODEProblem(f, [θ[1]], (0.0, 1.0), [θ[2]])
+    prob = ODE.ODEProblem(f, [θ[1]], (0.0, 1.0), [θ[2]])
 
-    function prob_func(prob, i, repeat)
-        remake(prob, u0 = 0.5 .+ i / 100 .* prob.u0)
+    function prob_func(prob, ctx)
+        ODE.remake(prob, u0 = 0.5 .+ ctx.sim_id / 100 .* prob.u0)
     end
 
-    ensemble_prob = EnsembleProblem(prob, prob_func = prob_func)
-    sim = solve(ensemble_prob, Tsit5(), ensemble, saveat = 0.1, trajectories = 100)
+    ensemble_prob = ODE.EnsembleProblem(prob; prob_func)
+    sim = ODE.solve(ensemble_prob, ODE.Tsit5(), ensemble, saveat = 0.1, trajectories = 100)
 end
 
 callback = function (θ, l) # callback function to observe training
@@ -276,15 +301,15 @@ callback = function (θ, l) # callback function to observe training
     false
 end
 
-opt = ADAM(0.1)
-loss_gpu(θ) = sum(abs2, 1.0 .- Array(model1(θ, EnsembleGPUArray())))
+opt = OPO.Adam(0.1)
+loss_gpu(θ) = sum(abs2, 1.0 .- Array(model1(θ, DiffEqGPU.EnsembleGPUArray())))
 l1 = loss_gpu(θ)
 
-adtype = Optimization.AutoZygote()
-optf = Optimization.OptimizationFunction((x, p) -> loss_gpu(x), adtype)
-optprob = Optimization.OptimizationProblem(optf, θ)
+adtype = OPT.AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+optf = OPT.OptimizationFunction((x, p) -> loss_gpu(x), adtype)
+optprob = OPT.OptimizationProblem(optf, θ)
 
-res_gpu = Optimization.solve(optprob, opt; callback = callback, maxiters = 100)
+res_gpu = OPT.solve(optprob, opt; callback, maxiters = 100)
 ```
 
 ## Multi-GPU Batching

@@ -3,3 +3,5 @@
 ```@docs
 SteadyStateAdjoint
 ```
+
+`UnconstrainedOptimizationAdjoint` is documented with the other [optimization adjoints](@ref sensitivity_optimization).

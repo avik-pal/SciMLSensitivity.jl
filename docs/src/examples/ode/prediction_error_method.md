@@ -19,8 +19,14 @@ In both of these examples, we may make use of measurements we have of the evolut
 We start by defining a model of the pendulum. The model takes a parameter $L$ corresponding to the length of the pendulum.
 
 ```@example PEM
-using DifferentialEquations, Optimization, OptimizationPolyalgorithms, Plots, Statistics,
-      DataInterpolations, ForwardDiff
+import OrdinaryDiffEq as ODE
+import Optimization as OPT
+import OptimizationPolyalgorithms as OPA
+import Plots
+import Statistics
+import DataInterpolations as DI
+import ForwardDiff as FD
+import SciMLBase as SMB
 
 tspan = (0.1, 20.0)
 tsteps = range(tspan[1], tspan[2], length = 1000)
@@ -31,8 +37,7 @@ function simulator(du, u, p, t) # Pendulum dynamics
     g = 9.82 # Gravitational constant
     L = p isa Number ? p : p[1] # Length of the pendulum
     gL = g / L
-    θ = u[1]
-    dθ = u[2]
+    θ, dθ = u
     du[1] = dθ
     du[2] = -gL * sin(θ)
 end
@@ -41,28 +46,28 @@ end
 We assume that the true length of the pendulum is $L = 1$, and generate some data from this system.
 
 ```@example PEM
-prob = ODEProblem(simulator, u0, tspan, 1.0) # Simulate with L = 1
-sol = solve(prob, Tsit5(), saveat = tsteps, abstol = 1e-8, reltol = 1e-8)
+prob = ODE.ODEProblem(simulator, u0, tspan, 1.0) # Simulate with L = 1
+sol = ODE.solve(prob, ODE.Tsit5(), saveat = tsteps, abstol = 1e-8, reltol = 1e-8)
 y = sol[1, :] # This is the data we have available for parameter estimation
-plot(y, title = "Pendulum simulation", label = "angle")
+Plots.plot(y, title = "Pendulum simulation", label = "angle")
 ```
 
 We also define functions that simulate the system and calculate the loss, given a parameter `p` corresponding to the length.
 
 ```@example PEM
 function simulate(p)
-    _prob = remake(prob, p = p)
-    solve(_prob, Tsit5(), saveat = tsteps, abstol = 1e-8, reltol = 1e-8)
+    _prob = ODE.remake(prob; p)
+    ODE.solve(_prob, ODE.Tsit5(), saveat = tsteps, abstol = 1e-8, reltol = 1e-8)
 end
 
 function simloss(p)
     yh = simulate(p)
-    if !SciMLBase.successful_retcode(yh.retcode)
+    if !SMB.successful_retcode(yh.retcode)
         return Inf
     end
     e2 = yh[1, :]
     e2 .= abs2.(y .- e2)
-    return mean(e2)
+    return Statistics.mean(e2)
 end
 ```
 
@@ -71,8 +76,8 @@ We now look at the loss landscape as a function of the pendulum length:
 ```@example PEM
 Ls = 0.01:0.01:2
 simlosses = simloss.(Ls)
-fig_loss = plot(Ls, simlosses, title = "Loss landscape", xlabel = "Pendulum length",
-                ylabel = "MSE loss", lab = "Simulation loss")
+fig_loss = Plots.plot(Ls, simlosses, title = "Loss landscape", xlabel = "Pendulum length",
+    ylabel = "MSE loss", lab = "Simulation loss")
 ```
 
 This figure is interesting, the loss is of course 0 for the true value $L=1$, but for values $L < 1$, the overall slope actually points in the wrong direction! Moreover, the loss is oscillatory, indicating that this is a terrible function to optimize, and that we would need a very good initial guess for a local search to converge to the true value. Note, this example is chosen to be one-dimensional in order to allow these kinds of visualizations, and one-dimensional problems are typically not hard to solve, but the reasoning extends to higher-dimensional and harder problems.
@@ -82,36 +87,35 @@ We will now move on to defining a *predictor* model. Our predictor will be very 
 To feed the sampled data into the continuous-time simulation, we make use of an interpolator. We also define new functions, `predictor` that contains the pendulum dynamics with the observer correction, a `prediction` function that performs the rollout (we're not using the word simulation to not confuse with the setting above) and a loss function.
 
 ```@example PEM
-y_int = LinearInterpolation(y, tsteps)
+y_int = DI.LinearInterpolation(y, tsteps)
 
 function predictor(du, u, p, t)
     g = 9.82
     L, K, y = p # pendulum length, observer gain and measurements
     gL = g / L
-    θ = u[1]
-    dθ = u[2]
+    θ, dθ = u
     yt = y(t)
     e = yt - θ
     du[1] = dθ + K * e
     du[2] = -gL * sin(θ)
 end
 
-predprob = ODEProblem(predictor, u0, tspan, nothing)
+predprob = ODE.ODEProblem(predictor, u0, tspan, nothing)
 
 function prediction(p)
     p_full = (p..., y_int)
-    _prob = remake(predprob, u0 = eltype(p).(u0), p = p_full)
-    solve(_prob, Tsit5(), saveat = tsteps, abstol = 1e-8, reltol = 1e-8)
+    _prob = ODE.remake(predprob, u0 = eltype(p).(u0), p = p_full)
+    ODE.solve(_prob, ODE.Tsit5(), saveat = tsteps, abstol = 1e-8, reltol = 1e-8)
 end
 
 function predloss(p)
     yh = prediction(p)
-    if !SciMLBase.successful_retcode(yh.retcode)
+    if !SMB.successful_retcode(yh.retcode)
         return Inf
     end
     e2 = yh[1, :]
     e2 .= abs2.(y .- e2)
-    return mean(e2)
+    return Statistics.mean(e2)
 end
 
 predlosses = map(Ls) do L
@@ -119,7 +123,7 @@ predlosses = map(Ls) do L
     predloss(p)
 end
 
-plot!(Ls, predlosses, lab = "Prediction loss")
+Plots.plot!(Ls, predlosses, lab = "Prediction loss")
 ```
 
 Once gain, we look at the loss as a function of the parameter, and this time it looks a lot better. The loss is not convex, but the gradient points in the right direction over a much larger interval. Here, we arbitrarily set the observer gain to $K=1$, we will later let the optimizer learn this parameter.
@@ -128,25 +132,23 @@ For completeness, we also perform estimation using both losses. We choose an ini
 
 ```@example PEM
 L0 = [0.7] # Initial guess of pendulum length
-adtype = Optimization.AutoForwardDiff()
-optf = Optimization.OptimizationFunction((x, p) -> simloss(x), adtype)
-optprob = Optimization.OptimizationProblem(optf, L0)
+adtype = OPT.AutoForwardDiff()
+optf = OPT.OptimizationFunction((x, p) -> simloss(x), adtype)
+optprob = OPT.OptimizationProblem(optf, L0)
 
-ressim = Optimization.solve(optprob, PolyOpt(),
-                            maxiters = 5000)
+ressim = OPT.solve(optprob, OPA.PolyOpt(), maxiters = 5000)
 ysim = simulate(ressim.u)[1, :]
 
-plot(tsteps, [y ysim], label = ["Data" "Simulation model"])
+Plots.plot(tsteps, [y ysim], label = ["Data" "Simulation model"])
 
 p0 = [0.7, 1.0] # Initial guess of length and observer gain K
-optf2 = Optimization.OptimizationFunction((p, _) -> predloss(p), adtype)
-optprob2 = Optimization.OptimizationProblem(optf2, p0)
+optf2 = OPT.OptimizationFunction((p, _) -> predloss(p), adtype)
+optprob2 = OPT.OptimizationProblem(optf2, p0)
 
-respred = Optimization.solve(optprob2, PolyOpt(),
-                             maxiters = 5000)
+respred = OPT.solve(optprob2, OPA.PolyOpt(), maxiters = 5000)
 ypred = simulate(respred.u)[1, :]
 
-plot!(tsteps, ypred, label = "Prediction model")
+Plots.plot!(tsteps, ypred, label = "Prediction model")
 ```
 
 The estimated parameters $(L, K)$ are
@@ -166,16 +168,15 @@ As a last step, we perform the estimation also with some measurement noise to ve
 
 ```@example PEM
 yn = y .+ 0.1f0 .* randn.(Float32)
-y_int = LinearInterpolation(yn, tsteps) # redefine the interpolator to contain noisy measurements
+y_int = DI.LinearInterpolation(yn, tsteps) # redefine the interpolator to contain noisy measurements
 
-optf = Optimization.OptimizationFunction((x, p) -> predloss(x), adtype)
-optprob = Optimization.OptimizationProblem(optf, p0)
+optf = OPT.OptimizationFunction((x, p) -> predloss(x), adtype)
+optprob = OPT.OptimizationProblem(optf, p0)
 
-resprednoise = Optimization.solve(optprob, PolyOpt(),
-                                  maxiters = 5000)
+resprednoise = OPT.solve(optprob, OPA.PolyOpt(), maxiters = 5000)
 
 yprednoise = prediction(resprednoise.u)[1, :]
-plot!(tsteps, yprednoise, label = "Prediction model with noisy measurements")
+Plots.plot!(tsteps, yprednoise, label = "Prediction model with noisy measurements")
 ```
 
 ```@example PEM
